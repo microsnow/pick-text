@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+
+# WorkBuddy project data (memory/cache)
+.workbuddy/
+
+# virtual environments (if created inside project)
+venv/
+.venv/
