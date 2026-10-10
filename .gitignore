@@ -19,3 +19,6 @@ region_presets.json
 
 # PyInstaller 临时 spec 缓存
 *.spec.bak
+
+# 分发用 zip 包（由 dist/ 压缩生成，体积大、可重构建）
+OCRClient-win64.zip

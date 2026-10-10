@@ -246,6 +246,54 @@ def _bring_to_front(hwnd):
         pass
 
 
+# ----------------- 单实例与首启判定 -----------------
+_kernel32 = ctypes.windll.kernel32
+_kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+_kernel32.CreateMutexW.restype = wintypes.HANDLE
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.GetLastError.restype = wintypes.DWORD
+_kernel32.SetLastError.argtypes = [wintypes.DWORD]
+
+_SINGLE_INSTANCE_MUTEX_NAME = "ScreenOCR_SingleInstance_Mutex_v1"
+_single_instance_handle = None
+
+
+def _another_instance_running():
+    """尝试创建全局命名互斥体。已存在→说明已有实例在运行（返回 True）。
+
+    本实例成功创建后持有句柄直到进程退出，从而互斥其它实例。
+    """
+    global _single_instance_handle
+    _kernel32.SetLastError(0)
+    h = _kernel32.CreateMutexW(None, False, _SINGLE_INSTANCE_MUTEX_NAME)
+    if not h:
+        return False
+    if _kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        _kernel32.CloseHandle(h)
+        return True
+    _single_instance_handle = h  # 持有到进程结束，维持单实例
+    return False
+
+
+def _first_run_marker_path():
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(appdata, "ScreenOCR", "firstrun.done")
+
+
+def _is_first_run():
+    return not os.path.exists(_first_run_marker_path())
+
+
+def _mark_first_run_done():
+    try:
+        p = _first_run_marker_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w"):
+            pass
+    except Exception:
+        pass
+
+
 class ResultWindow:
     def __init__(self):
         self.hwnd = None
@@ -404,6 +452,7 @@ class ResultWindow:
 
 
 result_win = ResultWindow()
+_FIRST_RUN = False  # 由 main() 在启动前设置：本次是否为首次运行（需自动弹“关于”）
 
 
 def ui_loop():
@@ -412,6 +461,14 @@ def ui_loop():
         return
     try:
         result_win.build()
+        if _FIRST_RUN:
+            # 首次运行：自动弹出“关于”（走与托盘菜单相同的 UI 线程消息路径）
+            try:
+                win32gui.PostMessage(result_win.hwnd, WM_ABOUT_SHOW, 0, 0)
+                _mark_first_run_done()
+                print("[UI] 首次运行：已弹出“关于”窗口。")
+            except Exception as e:
+                print(f"[UI] 首启弹窗失败: {e}")
         win32gui.PumpMessages()
     except Exception as e:
         print(f"[UI] 窗口线程异常: {e}")
@@ -1156,7 +1213,20 @@ def main():
     disable_tray = "--no-tray" in sys.argv
     tray_mode = (getattr(sys, "frozen", False) or force_tray) and not disable_tray
     if tray_mode:
+        # 单实例：检测到已有实例在运行，提示后退出（仅桌面形态启用，避免影响开发/控制台调试）
+        if _another_instance_running():
+            try:
+                win32gui.MessageBox(
+                    0, "屏幕OCR 已在运行。", "提示",
+                    win32con.MB_OK | win32con.MB_ICONINFORMATION | win32con.MB_TOPMOST,
+                )
+            except Exception:
+                pass
+            os._exit(0)
         setup_logging()
+
+    global _FIRST_RUN
+    _FIRST_RUN = _is_first_run()  # 首次运行（按机器记录）则自动弹“关于”
 
     print("=" * 46)
     print("  屏幕 OCR 客户端（全屏 + 区域多选 + 选区预设 · 离线）")
