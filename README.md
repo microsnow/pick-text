@@ -10,7 +10,7 @@
 - **选区预设（多选区·一键触发）**：用 `Ctrl+Shift+1`~`Ctrl+Shift+9` 把屏幕上某块区域（可框选多个）**存为命名选区**并落盘；之后按 `Ctrl+Alt+1`~`Ctrl+Alt+9` 即可**一键自动截该区域 → OCR → 静默复制到剪贴板**，无需每次重画。适合反复取同一处固定文字（字幕条、计时器、比分牌、表单框等）。
 - **一键复制全部**：识别完成后整段文本自动写入剪贴板，可直接粘贴。
 - **选择复制**：弹出原生结果窗口，鼠标框选任意部分后 `Ctrl+C` 即可复制；也可点「复制全部」按钮。
-- **ESC 智能退出**：区域选择进行中按 `ESC` 仅**取消当前选区**（回到待机，不退出程序）；待机 / 全屏模式下按 `ESC` 才退出整个程序，避免误关。
+- **ESC 关闭当前弹窗**：结果窗口弹出时按 `ESC` 直接关闭；区域 / 定义模式进行中按 `ESC` 取消当前选区。两种情况都**不退出程序**——程序退出统一通过**系统托盘右键「退出」**菜单，避免在其它软件中误按 `ESC` 关掉整个程序。
 - **离线引擎**：基于 [RapidOCR](https://github.com/RapidAI/RapidOCR)（ONNX 推理），内置模型，无需联网。
 
 ## 运行环境
@@ -67,8 +67,9 @@ C:\Users\microsnow\.workbuddy\binaries\python\envs\ocrclient\Scripts\python.exe 
 | 在结果窗口中框选文字 + `Ctrl+C` | 复制选中部分（选择复制） |
 | 点结果窗口「复制全部」按钮 | 复制整段文本 |
 | 点「关闭」或标题栏 X | 隐藏结果窗口（下次识别再显示） |
-| 按 `ESC`（区域模式进行中） | 取消当前选区，回到待机（**不退出程序**） |
-| 按 `ESC`（待机 / 全屏模式） | 退出整个程序 |
+| 结果窗口可见时 按 `ESC` | **关闭结果窗口**（不退出程序） |
+| 按 `ESC`（区域 / 定义模式进行中） | 取消当前选区，回到待机（**不退出程序**） |
+| 系统托盘右键「退出」 | 退出整个程序 |
 | 按 `Ctrl+Shift+1`~`9` | 进入**定义选区**模式：拖拽框选（可多选）→ 确认后存为「选区 N」并写入 `region_presets.json` |
 | 定义模式中 左键拖拽 / 右键 / `Enter` / `Backspace` / `Esc` | 与区域模式一致（框选 / 确认 / 撤销 / 取消），取消则本次不保存 |
 | 按 `Ctrl+Alt+1`~`9` | **触发选区 N**：自动截该槽位区域 → OCR → 静默复制到剪贴板，并弹出轻量 Toast 提示（不抢焦点，约 1.6 秒后自动消失）；控制台同步打印日志 |
@@ -96,7 +97,6 @@ C:\Users\microsnow\.workbuddy\binaries\python\envs\ocrclient\Scripts\python.exe 
 |---|---|---|
 | `HOTKEY` | `<ctrl>+<alt>+o` | 全屏识别触发快捷键，可改为 `<ctrl>+<shift>+o` 等 |
 | `REGION_HOTKEY` | `<ctrl>+<alt>+r` | 区域选择模式快捷键：进入框选 / 再次按下取消本次选择 |
-| `EXIT_KEY` | `<esc>` | 退出快捷键 |
 | `MONITOR` | `1` | `1` = 主显示器；`0` = 全部显示器（拼接大图，4K 下较慢）；区域选择也限定在该显示器范围内 |
 | `AUTO_COPY_ALL` | `True` | 识别后是否自动复制全部到剪贴板；设 `False` 则只弹窗手动选择 |
 | `SHOW_WINDOW` | `True` | 是否弹出结果窗口（支持框选复制） |
@@ -110,10 +110,13 @@ C:\Users\microsnow\.workbuddy\binaries\python\envs\ocrclient\Scripts\python.exe 
 
 ```
 09-ocr/
-├── main.py          # 主程序：截屏 + OCR + 剪贴板 + 原生结果窗口 + 选区预设
+├── main.py          # 主程序：截屏 + OCR + 剪贴板 + 原生结果窗口 + 选区预设 + 系统托盘
 ├── region_presets.json # 选区预设落盘（运行时生成；定义选区后自动创建）
 ├── requirements.txt # Python 依赖清单
-├── run.bat          # 双击启动器（调用 run.ps1）
+├── ocrclient.spec   # PyInstaller 单文件夹打包配置（onedir）
+├── assets/
+│   └── icon.ico     # 桌面程序图标（PIL 生成，蓝底 "Aa"）
+├── run.bat          # 开发态双击启动器（调用 run.ps1）
 ├── run.ps1          # PowerShell 启动脚本（环境检查 + 启动）
 └── README.md        # 本说明文档
 ```
@@ -140,3 +143,40 @@ A：全屏模式识别整屏所有文字；区域模式只识别你框选的若�
 
 **Q：能识别表格 / 复杂版面吗？**
 A：RapidOCR 为行列文本识别，适合一般文字抓取。如需版面分析（表格、排版还原），可后续替换为 PaddleOCR 的 PP-Structure（引擎已抽象，便于切换）。
+
+## 打包为桌面应用（Windows 10 / 11）
+
+本项目可打包为**单文件夹桌面程序**：系统托盘常驻、无黑框控制台、双击即跑，兼容 Windows 10 / 11 64 位。
+
+### 构建环境
+- Windows 10 / 11（构建机即目标平台，无需跨平台）
+- Python 3.13（或 3.9+）隔离 venv
+- 依赖：`requirements.txt` + `pyinstaller` + `pystray`（托盘，依赖 `pillow`）
+
+### 构建步骤
+```bat
+:: 1) 建隔离 venv 并安装依赖（首次）
+C:\Users\microsnow\.workbuddy\binaries\python\versions\3.13.12\python.exe -m venv build_venv
+build_venv\Scripts\python.exe -m pip install -r requirements.txt pyinstaller pystray
+
+:: 2) 打包（单文件夹 onedir）
+build_venv\Scripts\python.exe -m PyInstaller -y ocrclient.spec
+```
+产物位于 `dist/OCRClient/`：
+- `OCRClient.exe` —— 启动器（双击即运行，无控制台窗口）
+- `_internal/` —— 全部依赖与 ONNX 模型（**必须与 exe 一起保留、整体复制**）
+
+### 运行时形态
+- 启动后在**系统托盘**显示图标，右键菜单含「关于 / 快捷键」「退出」。
+- 全局热键与脚本版完全一致（见上）。`ESC` 用于**关闭 / 取消当前弹窗**（结果窗口或选区），**不会退出程序**；托盘「退出」干净结束进程。
+- OCR 模型（RapidOCR 三个 ONNX）已内置，全程离线。
+- 启动日志（含报错）重定向至 `dist/OCRClient/ocrclient.log`，便于排障。
+
+### 兼容性
+- 目标：Windows 10 / 11 64 位。当前在 Windows 11 构建为 64 位 exe。
+- 若需在较早的 Windows 10（如 1809 之前）运行，建议改用 Python 3.11 构建以最大化兼容；Python 3.13 运行时要求 Windows 10 22H2 及以上。
+- 分发：复制整个 `dist/OCRClient/` 文件夹即可，无需安装；如需“正式安装包”可用 Inno Setup / NSIS 包装。
+
+### 注意
+- `region_presets.json` 在打包后写入 `dist/OCRClient/`（与 exe 同级），重定义选区会更新该文件。
+- 杀毒软件可能对 PyInstaller 产物误报，属正常现象；如需消除可对 exe 进行代码签名。

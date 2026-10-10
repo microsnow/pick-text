@@ -31,6 +31,8 @@ import sys
 import time
 import threading
 import json
+import ctypes
+from ctypes import wintypes
 
 import numpy as np
 import mss
@@ -47,14 +49,23 @@ except Exception as _e:  # 无 pywin32 时退回控制台输出
     HAS_WIN32 = False
     print(f"[提示] 未检测到 pywin32（{_e}），区域选择等 GUI 功能将不可用。")
 
+# 系统托盘（桌面应用形态）：包装成常驻后台、右下角图标的“正式”程序
+try:
+    import pystray
+    from PIL import Image, ImageDraw, ImageFont
+    HAS_TRAY = True
+except Exception as _te:
+    HAS_TRAY = False
+    print(f"[提示] 未检测到 pystray/PIL（{_te}），将不显示系统托盘图标。")
+
 # ===================== 配置区 =====================
 HOTKEY = "<ctrl>+<alt>+o"   # 全屏识别快捷键
 REGION_HOTKEY = "<ctrl>+<alt>+r"  # 区域选择识别快捷键（可多选区域）
-EXIT_KEY = "<esc>"          # 退出快捷键
 MONITOR = 1                 # 1 = 主显示器；0 = 全部显示器（拼接大图，较慢）
 AUTO_COPY_ALL = True        # OCR 后自动复制全部到剪贴板（一键复制全部）
 SHOW_WINDOW = True          # 是否弹出结果窗口（支持框选复制）
 REGION_ALPHA = 160          # 区域选择遮罩的暗化不透明度（0-255，越大越暗）
+CLOSE_KEY = "<esc>"          # 关闭/取消“当前弹窗”（结果窗口或区域遮罩），绝不退出程序
 
 # ----------------- 选区预设（数字槽位） -----------------
 # 把屏幕上某块区域“存”成预设，绑定快捷键；之后一键自动截该区域→OCR→静默复制。
@@ -74,7 +85,7 @@ def _pretty(hk):
 
 HOTKEY_PRETTY = _pretty(HOTKEY)
 REGION_HOTKEY_PRETTY = _pretty(REGION_HOTKEY)
-EXIT_KEY_PRETTY = _pretty(EXIT_KEY)
+CLOSE_KEY_PRETTY = _pretty(CLOSE_KEY)
 TRIGGER_HOTKEY_PRETTY_TMPL = "Ctrl+Alt+%d"
 DEFINE_HOTKEY_PRETTY_TMPL = "Ctrl+Shift+%d"
 
@@ -103,6 +114,7 @@ if HAS_WIN32:
 
 _engine = None
 _lock = threading.Lock()
+HOTKEYS = None   # 全局热键监听器（托盘“退出”需停止它）
 
 # 当前活动的区域选择器（供全局热键“取消”使用）
 region_sel = None
@@ -197,6 +209,43 @@ def grab_monitor(mon):
 
 
 # ----------------- 原生结果窗口（无 tkinter 依赖） -----------------
+WM_RESULT_SHOW = win32con.WM_APP + 2   # 由窗口所属线程执行“显示”（线程安全）
+WM_RESULT_HIDE = win32con.WM_APP + 3   # 由窗口所属线程执行“隐藏/关闭”
+WM_ABOUT_SHOW = win32con.WM_APP + 4    # 由窗口所属线程弹出“关于”模态框（线程安全）
+
+
+def _about_text():
+    """「关于」弹窗内容（托盘菜单与 UI 线程共用）。"""
+    return (
+        "屏幕 OCR 客户端（离线）\n\n"
+        f"全屏识别 : {HOTKEY_PRETTY}\n"
+        f"区域选择 : {REGION_HOTKEY_PRETTY}\n\n"
+        "选区预设 : 定义 Ctrl+Shift+1~9 → 触发 Ctrl+Alt+1~9\n\n"
+        "关闭弹窗 : 按 Esc（或点结果窗口的“关闭”/X；选区中按 Esc 取消选区）\n"
+        "退出程序 : 右键托盘图标 → 退出（仅此一种方式）"
+    )
+
+
+# 用 ctypes 直接调 Win32 抢前台焦点：pywin32 在某些版本缺失 AllowSetForegroundWindow，
+# 而跨线程（OCR 工作线程 -> UI 线程）的窗口必须显式允许前台切换，否则弹窗拿不到焦点、
+# 点“关闭”需点两次甚至“关不上”。ASFW_ANY = 0xFFFFFFFF 允许任意进程设置前台窗口。
+_user32 = ctypes.windll.user32
+_user32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
+_user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+
+
+def _bring_to_front(hwnd):
+    """可靠地把窗口带到前台并抢焦点（绕过 pywin32 缺失的 API）。"""
+    try:
+        _user32.AllowSetForegroundWindow(0xFFFFFFFF)
+    except Exception:
+        pass
+    try:
+        _user32.SetForegroundWindow(int(hwnd))
+    except Exception:
+        pass
+
+
 class ResultWindow:
     def __init__(self):
         self.hwnd = None
@@ -258,6 +307,37 @@ class ResultWindow:
         self.ready = True
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == WM_RESULT_SHOW:
+            # 在窗口所属线程中执行“显示”，避免跨线程操作 Win32 窗口导致无法交互/无法关闭
+            try:
+                win32gui.SendMessage(self.edit, win32con.WM_SETTEXT, 0, self.full_text)
+                win32gui.ShowWindow(self.hwnd, win32con.SW_SHOW)
+                win32gui.SetWindowPos(
+                    self.hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE,
+                )
+                # 允许本进程抢前台，确保弹窗能拿到焦点、点击“关闭”即时生效
+                _bring_to_front(self.hwnd)
+            except Exception as e:
+                print(f"[UI] 显示窗口异常: {e}")
+            return 0
+        if msg == WM_RESULT_HIDE:
+            self._real_hide()
+            return 0
+        if msg == WM_ABOUT_SHOW:
+            # 在窗口所属线程（ui_loop）中以本窗口为 owner 弹出原生模态消息框：
+            # 确定按钮 / Esc 的关闭完全由 OS 模态循环接管，不再在托盘线程里
+            # 直接调 MessageBox（那是在 pystray 回调栈内阻塞，导致弹窗关不掉）。
+            try:
+                win32gui.MessageBox(
+                    self.hwnd, _about_text(), "关于 · 屏幕OCR",
+                    win32con.MB_OK | win32con.MB_ICONINFORMATION
+                    | win32con.MB_SETFOREGROUND | win32con.MB_TOPMOST,
+                )
+                print("[UI] 关于弹窗已关闭。")
+            except Exception as e:
+                print(f"[UI] 关于弹窗异常: {e}")
+            return 0
         if msg == win32con.WM_COMMAND:
             ctrl_id = wparam & 0xFFFF
             if ctrl_id == 2:          # “复制全部”按钮
@@ -265,12 +345,41 @@ class ResultWindow:
                     pyperclip.copy(self.full_text)
                     print("[OCR] 已复制全部到剪贴板。")
             elif ctrl_id == 3:        # “关闭”按钮
-                win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
+                self._do_hide()
             return 0
-        if msg == win32con.WM_CLOSE:  # 点标题栏 X：隐藏而非销毁
-            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+        if msg == win32con.WM_CLOSE:  # 点标题栏 X：隐藏（可重复弹出）
+            self._do_hide()
             return 0
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+    def _do_hide(self):
+        """请求隐藏：投递到窗口自己的消息循环下一轮处理。
+
+        关键：绝不能在 WndProc 处理 WM_COMMAND/WM_CLOSE（即窗口过程自身）里
+        直接 ShowWindow(SW_HIDE) 隐藏当前窗口——这属于“在消息回调内同步隐藏自身”，
+        会触发 Win32 消息循环重入，表现为“点了关闭却关不掉”。改为 PostMessage 一个
+        自定义消息，由 PumpMessages 在下一轮迭代里执行真正的隐藏（见 _real_hide）。
+        """
+        if HAS_WIN32 and self.hwnd:
+            try:
+                win32gui.PostMessage(self.hwnd, WM_RESULT_HIDE, 0, 0)
+            except Exception:
+                pass
+
+    def _real_hide(self):
+        """真正执行隐藏（运行在窗口所属线程的消息循环内，安全、无重入）。"""
+        try:
+            win32gui.SetWindowPos(
+                self.hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE,
+            )
+        except Exception:
+            pass
+        try:
+            win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
+        except Exception:
+            pass
+        print("[UI] 结果窗口已隐藏。")
 
     def show(self, text):
         self.full_text = _crlf(text)
@@ -279,17 +388,9 @@ class ResultWindow:
             print(text)
             print("--------------------------------")
             return
+        # 通过 PostMessage 让窗口所属线程执行显示，跨线程安全
         try:
-            win32gui.SendMessage(self.edit, win32con.WM_SETTEXT, 0, self.full_text)
-            win32gui.ShowWindow(self.hwnd, win32con.SW_SHOW)
-            win32gui.SetWindowPos(
-                self.hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
-                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE,
-            )
-            try:
-                win32gui.SetForegroundWindow(self.hwnd)
-            except Exception:
-                pass
+            win32gui.PostMessage(self.hwnd, WM_RESULT_SHOW, 0, 0)
         except Exception as e:
             print(f"[UI] 显示窗口失败，退回控制台: {e}")
             print(text)
@@ -297,7 +398,7 @@ class ResultWindow:
     def hide(self):
         if HAS_WIN32 and self.hwnd:
             try:
-                win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
+                win32gui.PostMessage(self.hwnd, WM_RESULT_HIDE, 0, 0)
             except Exception:
                 pass
 
@@ -326,7 +427,7 @@ class RegionSelector:
       - 右键 / Enter：确认，返回所有区域
       - Backspace：撤销上一个区域（需窗口获得焦点）
       - 再次按区域快捷键 / 自定义取消消息：放弃本次选择
-      - ESC：退出整个程序（全局快捷键）
+      - ESC：取消本次选区（仅取消选区，不退出程序）
     区域坐标以“显示器左上角”为原点（与 mss 抓取坐标一致）。
     """
 
@@ -369,20 +470,15 @@ class RegionSelector:
         )
 
     def _confirm(self):
+        # 不直接在 WndProc 内 ShowWindow(SW_HIDE) 隐藏自身（会引发消息循环重入），
+        # 仅设置结果并退出消息循环，由 select() 末尾的 DestroyWindow 移除窗口。
         self.confirmed = True
-        try:
-            win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
-        except Exception:
-            pass
         win32gui.PostQuitMessage(0)
 
     def _cancel(self):
+        # 同上：仅设标志 + 退出循环，避免“在消息回调内隐藏自身”。
         self.confirmed = False
         self.rects = []
-        try:
-            win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
-        except Exception:
-            pass
         win32gui.PostQuitMessage(0)
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
@@ -430,6 +526,8 @@ class RegionSelector:
                 if self.rects:
                     self.rects.pop()
                 win32gui.InvalidateRect(hwnd, None, True)
+            elif vk == 27:          # Esc 取消选区
+                self._cancel()
             return 0
         if msg == win32con.WM_PAINT:
             self._paint(hwnd)
@@ -911,6 +1009,25 @@ def on_activate_region():
     threading.Thread(target=do_region_ocr, daemon=True).start()
 
 
+def on_activate_esc_close():
+    """ESC：关闭/取消“当前弹窗”，绝不退出整个程序。
+
+    之前 ESC 是“退出程序”，已按需求删除。但用户仍希望用 ESC 关掉弹窗，
+    故重设计为：有区域/定义选区在进行 → 取消选区；否则 → 隐藏 OCR 结果窗口。
+    走全局热键，不依赖弹窗是否拥有焦点，因此一定可用（区别于按钮的 WM_COMMAND）。
+    """
+    global region_sel
+    # 1) 区域/定义选区进行中 → 取消选区（与“再次按快捷键取消”同一条取消消息）
+    if region_sel is not None and getattr(region_sel, "hwnd", None):
+        try:
+            win32gui.PostMessage(region_sel.hwnd, WM_REGION_CANCEL, 0, 0)
+        except Exception:
+            pass
+        return
+    # 2) 否则隐藏 OCR 结果窗口（若未显示则无副作用）；走 WM_RESULT_HIDE，最干净路径
+    result_win.hide()
+
+
 def on_activate_trigger(slot):
     """触发选区：一键自动截已存区域 → OCR → 静默复制。"""
     threading.Thread(target=trigger_preset, args=(slot,), daemon=True).start()
@@ -930,24 +1047,123 @@ def on_activate_define(slot):
     threading.Thread(target=do_define_preset, args=(slot,), daemon=True).start()
 
 
-def on_activate_exit():
-    global region_sel
-    # 区域选择进行中：ESC 仅取消当前选区、回到待机，不退出程序
-    if region_sel is not None and getattr(region_sel, "hwnd", None):
-        win32gui.PostMessage(region_sel.hwnd, WM_REGION_CANCEL, 0, 0)
+
+
+# ----------------- 系统托盘（桌面应用形态） -----------------
+def _app_dir():
+    """返回程序所在目录：打包后为 exe 目录，开发时为脚本目录。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def setup_logging():
+    """无控制台（frozen）时把 stdout/stderr 重定向到日志文件，便于排障。"""
+    log_path = os.path.join(_app_dir(), "ocrclient.log")
+    try:
+        fh = open(log_path, "a", encoding="utf-8", buffering=1)
+    except Exception as e:
+        print(f"[日志] 无法写入日志文件 {log_path}: {e}")
         return
-    print("\n[退出] 收到 ESC，正在关闭…")
+
+    class _Tee:
+        def write(self, s):
+            try:
+                fh.write(s)
+            except Exception:
+                pass
+            return len(s) if isinstance(s, str) else 1
+
+        def flush(self):
+            try:
+                fh.flush()
+            except Exception:
+                pass
+
+    sys.stdout = _Tee()
+    sys.stderr = _Tee()
+    print(f"[日志] 输出已重定向到 {log_path}")
+
+
+def build_tray_icon_image():
+    """用 PIL 绘制一个简单蓝色图标（无需外部素材）。"""
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([4, 4, size - 4, size - 4], radius=14,
+                        fill=(0, 120, 215, 255))
+    try:
+        fnt = ImageFont.truetype("msyh.ttc", 34)
+    except Exception:
+        fnt = ImageFont.load_default()
+    d.text((size // 2, size // 2), "Aa", font=fnt,
+           fill=(255, 255, 255, 255), anchor="mm")
+    return img
+
+
+def show_about():
+    """托盘菜单“关于”：把弹窗转交 UI 线程执行（PostMessage），托盘回调立即返回。
+
+    关键：绝不能在 pystray 的菜单回调线程里直接调 win32gui.MessageBox——
+    它会阻塞托盘线程的消息循环且弹窗交互异常（表现为“确定”点不动、关不掉）。
+    """
+    if not HAS_WIN32:
+        print(_about_text())
+        return
+    if result_win is not None and result_win.ready and result_win.hwnd:
+        win32gui.PostMessage(result_win.hwnd, WM_ABOUT_SHOW, 0, 0)
+        return
+    # 结果窗口尚未就绪（罕见）：退回控制台输出，避免在托盘线程弹框
+    print(_about_text())
+
+
+def on_tray_exit(icon, item):
+    """托盘“退出”：停止热键监听与托盘图标，干净退出。"""
+    try:
+        if HOTKEYS is not None:
+            HOTKEYS.stop()
+    except Exception:
+        pass
+    try:
+        icon.stop()
+    except Exception:
+        pass
     os._exit(0)
 
 
+def run_tray():
+    """在独立线程中运行系统托盘图标（不阻塞热键主线程）。"""
+    if not HAS_TRAY:
+        return
+    try:
+        icon = pystray.Icon(
+            "ScreenOCR",
+            build_tray_icon_image(),
+            "屏幕OCR（离线）",
+            menu=pystray.Menu(
+                pystray.MenuItem("关于 / 快捷键", show_about),
+                pystray.MenuItem("退出", on_tray_exit),
+            ),
+        )
+        icon.run()
+    except Exception as e:
+        print(f"[托盘] 启动失败，退回无托盘模式: {e}")
+
+
 def main():
+    # 桌面应用形态：打包后（frozen）默认启用系统托盘；可用 --tray 强制、--no-tray 禁用
+    force_tray = "--tray" in sys.argv
+    disable_tray = "--no-tray" in sys.argv
+    tray_mode = (getattr(sys, "frozen", False) or force_tray) and not disable_tray
+    if tray_mode:
+        setup_logging()
+
     print("=" * 46)
     print("  屏幕 OCR 客户端（全屏 + 区域多选 + 选区预设 · 离线）")
     print("=" * 46)
     load_presets()
     print(f"  全屏识别   : {HOTKEY_PRETTY}")
     print(f"  区域选择   : {REGION_HOTKEY_PRETTY}（可框选多个区域）")
-    print(f"  退出快捷键 : {EXIT_KEY_PRETTY}")
     print(f"  识别范围   : {'全部显示器' if MONITOR == 0 else '主显示器'}")
     print(f"  自动复制全部 : {'开' if AUTO_COPY_ALL else '关'}")
     print(f"  结果窗口   : {'开' if SHOW_WINDOW and HAS_WIN32 else '关(控制台)'}")
@@ -956,20 +1172,25 @@ def main():
     print(f"  已存选区   : {len(presets)} 个（见 region_presets.json）")
     print("  全屏模式：按快捷键识别整屏；区域模式：拖拽框选多区域后右键确认。")
     print("  选区预设：Ctrl+Shift+N 框选存为选区N；之后 Ctrl+Alt+N 一键识别并静默复制。")
-    print("  选区中按 Esc 取消选区；待机按 Esc 退出程序。")
+    print("  按 Esc 关闭/取消当前弹窗（结果窗口或选区）；退出程序请右键托盘图标。")
     print("=" * 46)
 
     threading.Thread(target=ui_loop, daemon=True).start()
 
+    if tray_mode and HAS_TRAY:
+        threading.Thread(target=run_tray, daemon=True).start()
+
     hotkeys_map = {
         HOTKEY: on_activate_ocr,
         REGION_HOTKEY: on_activate_region,
-        EXIT_KEY: on_activate_exit,
+        CLOSE_KEY: on_activate_esc_close,
     }
     for n in range(1, PRESET_SLOTS + 1):
         hotkeys_map[TRIGGER_HOTKEY_TMPL % n] = (lambda s=n: on_activate_trigger(s))
         hotkeys_map[DEFINE_HOTKEY_TMPL % n] = (lambda s=n: on_activate_define(s))
     hotkeys = keyboard.GlobalHotKeys(hotkeys_map)
+    global HOTKEYS
+    HOTKEYS = hotkeys
     try:
         hotkeys.run()  # 阻塞，直到被 stop / 进程退出
     except KeyboardInterrupt:
