@@ -15,6 +15,11 @@
 - 右键 / Enter 确认：仅识别各区域中的内容，多个区域之间用换行隔开。
 - 再次按 Ctrl+Alt+R 重选/取消本次选择；ESC 取消选区（不退出程序）。
 
+3) 选区预设（快捷键 Ctrl+Shift+1~9 定义 / Ctrl+Alt+1~9 触发）★新增
+   - 用 Ctrl+Shift+N 框选并把屏幕某块区域“存”为命名选区（落盘到 region_presets.json）。
+   - 之后按 Ctrl+Alt+N 一键自动截该区域 → OCR → 静默复制到剪贴板，无需每次重画。
+   - 适合反复取同一处固定文字（字幕条、计时器、比分牌、表单框等）。
+
 依赖：mss / rapidocr-onnxruntime / pynput / pyperclip / numpy / pywin32
 
 运行（在隔离 venv 中）：
@@ -25,6 +30,7 @@ import os
 import sys
 import time
 import threading
+import json
 
 import numpy as np
 import mss
@@ -49,6 +55,13 @@ MONITOR = 1                 # 1 = 主显示器；0 = 全部显示器（拼接大
 AUTO_COPY_ALL = True        # OCR 后自动复制全部到剪贴板（一键复制全部）
 SHOW_WINDOW = True          # 是否弹出结果窗口（支持框选复制）
 REGION_ALPHA = 160          # 区域选择遮罩的暗化不透明度（0-255，越大越暗）
+
+# ----------------- 选区预设（数字槽位） -----------------
+# 把屏幕上某块区域“存”成预设，绑定快捷键；之后一键自动截该区域→OCR→静默复制。
+PRESET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "region_presets.json")
+PRESET_SLOTS = 9            # 支持 1~9 号槽位
+DEFINE_HOTKEY_TMPL = "<ctrl>+<shift>+%d"    # 定义选区：Ctrl+Shift+1..9
+TRIGGER_HOTKEY_TMPL = "<ctrl>+<alt>+%d"     # 触发选区：Ctrl+Alt+1..9
 # =================================================
 
 # 给界面显示用的人类可读快捷键
@@ -62,6 +75,8 @@ def _pretty(hk):
 HOTKEY_PRETTY = _pretty(HOTKEY)
 REGION_HOTKEY_PRETTY = _pretty(REGION_HOTKEY)
 EXIT_KEY_PRETTY = _pretty(EXIT_KEY)
+TRIGGER_HOTKEY_PRETTY_TMPL = "Ctrl+Alt+%d"
+DEFINE_HOTKEY_PRETTY_TMPL = "Ctrl+Shift+%d"
 
 
 def _crlf(s):
@@ -103,6 +118,46 @@ def _next_region_class_name():
     return "OCRRegionSel_%d" % _region_class_seq
 
 
+# Toast 窗口类名自增（每次一个唯一名，避免“类已存在”1410）
+_toast_class_seq = 0
+
+
+def _next_toast_class_name():
+    global _toast_class_seq
+    _toast_class_seq += 1
+    return "OCRToast_%d" % _toast_class_seq
+
+
+# ----------------- 选区预设存储 -----------------
+# presets: { "1": {"name": "选区1", "monitor": 1, "rects": [[x, y, w, h], ...]}, ... }
+presets = {}
+_active_mode = None   # "region" | "define"：当前是否在进行框选及其类型
+_active_slot = None   # define 模式下框选对应的槽位
+
+
+def load_presets():
+    """启动时从 JSON 加载已保存的选区预设（重启后保留）。"""
+    global presets
+    presets = {}
+    if os.path.exists(PRESET_FILE):
+        try:
+            with open(PRESET_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                presets = data
+        except Exception as e:
+            print(f"[预设] 读取 {PRESET_FILE} 失败，已忽略: {e}")
+
+
+def save_presets():
+    """把当前选区预设写回 JSON 文件。"""
+    try:
+        with open(PRESET_FILE, "w", encoding="utf-8") as f:
+            json.dump(presets, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[预设] 保存 {PRESET_FILE} 失败: {e}")
+
+
 def get_engine():
     """懒加载 RapidOCR 引擎（模型随包内置，离线）。"""
     global _engine
@@ -114,8 +169,11 @@ def get_engine():
 
 
 def get_monitor(index):
-    """返回 mss 的显示器字典 {left, top, width, height}（绝对坐标）。"""
+    """返回 mss 的显示器字典 {left, top, width, height}（绝对坐标），越界自动回退。"""
     with mss.MSS() as sct:
+        max_idx = len(sct.monitors) - 1
+        if index < 1 or index > max_idx:
+            index = 1 if max_idx >= 1 else 0
         return sct.monitors[index]
 
 
@@ -283,6 +341,7 @@ class RegionSelector:
         self._inst = None
         self._atom = None
         self._class_name = None
+        self.cancel_hint = REGION_HOTKEY_PRETTY  # 顶部提示栏显示的“再次按此键取消”
 
     def _build(self, mon):
         self._inst = win32api.GetModuleHandle(None)
@@ -418,7 +477,7 @@ class RegionSelector:
         win32gui.SetTextColor(hdc, win32api.RGB(255, 255, 255))
         hint = (f"已选 {len(self.rects)} 个区域   ·   左键拖拽框选(可多选)   ·   "
                 f"右键/Enter 确认   ·   Esc 取消选区   ·   "
-                f"再次按 {REGION_HOTKEY_PRETTY} 重选")
+                f"再次按 {self.cancel_hint} 重选")
         win32gui.DrawText(
             hdc, hint, -1, (0, 0, w, bar_h),
             win32con.DT_CENTER | win32con.DT_VCENTER | win32con.DT_SINGLELINE,
@@ -459,6 +518,145 @@ class RegionSelector:
             pass
         self._class_name = None
         return self.confirmed, self.rects
+
+
+# ----------------- 轻量 Toast 提示（原生窗口，不抢焦点） -----------------
+class ToastWindow:
+    """一个短暂出现的原生浮层，显示一行提示后自动消失。
+
+    使用 WS_EX_NOACTIVATE + SW_SHOWNOACTIVATE，绝不抢走当前窗口焦点，
+    适合在“静默复制”等场景给出轻提示。每条 toast 独立线程 + 独立窗口类，
+    互不干扰；显示 duration 毫秒后自动隐藏并退出消息循环。
+    """
+
+    def __init__(self, text, x, y, w, h, duration_ms):
+        self.text = text
+        self.x, self.y, self.w, self.h = x, y, w, h
+        self.duration = duration_ms
+        self.hwnd = None
+        self._inst = None
+        self._atom = None
+        self._class_name = None
+
+    def _build(self):
+        self._inst = win32api.GetModuleHandle(None)
+        wc = win32gui.WNDCLASS()
+        wc.hInstance = self._inst
+        wc.lpszClassName = _next_toast_class_name()
+        self._class_name = wc.lpszClassName
+        wc.lpfnWndProc = self._wndproc
+        wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
+        wc.hbrBackground = win32con.COLOR_WINDOW + 1
+        wc.style = win32con.CS_HREDRAW | win32con.CS_VREDRAW
+        self._atom = win32gui.RegisterClass(wc)
+        ex_style = (win32con.WS_EX_LAYERED | win32con.WS_EX_TOPMOST
+                    | win32con.WS_EX_NOACTIVATE)
+        self.hwnd = win32gui.CreateWindowEx(
+            ex_style, self._atom, "", win32con.WS_POPUP,
+            self.x, self.y, self.w, self.h, 0, 0, self._inst, None,
+        )
+        # 半透明暗底，弱化存在感
+        win32gui.SetLayeredWindowAttributes(self.hwnd, 0, 230, win32con.LWA_ALPHA)
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == win32con.WM_PAINT:
+            self._paint(hwnd)
+            return 0
+        if msg == win32con.WM_TIMER:
+            try:
+                win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+            except Exception:
+                pass
+            win32gui.PostQuitMessage(0)
+            return 0
+        if msg == win32con.WM_DESTROY:
+            return 0
+        return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+    def _paint(self, hwnd):
+        hdc, ps = win32gui.BeginPaint(hwnd)
+        brush = win32gui.CreateSolidBrush(win32api.RGB(30, 30, 30))
+        win32gui.FillRect(hdc, (0, 0, self.w, self.h), brush)
+        win32gui.DeleteObject(brush)
+        pen = win32gui.CreatePen(win32con.PS_SOLID, 1, win32api.RGB(0, 191, 255))
+        old = win32gui.SelectObject(hdc, pen)
+        win32gui.Rectangle(hdc, 0, 0, self.w - 1, self.h - 1)
+        win32gui.SelectObject(hdc, old)
+        win32gui.DeleteObject(pen)
+        lf = win32gui.LOGFONT()
+        lf.lfHeight = -16
+        lf.lfFaceName = "Microsoft YaHei"
+        hf = win32gui.CreateFontIndirect(lf)
+        oldf = win32gui.SelectObject(hdc, hf)
+        win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
+        win32gui.SetTextColor(hdc, win32api.RGB(255, 255, 255))
+        win32gui.DrawText(
+            hdc, self.text, -1, (12, 0, self.w - 12, self.h),
+            win32con.DT_VCENTER | win32con.DT_SINGLELINE | win32con.DT_LEFT,
+        )
+        win32gui.SelectObject(hdc, oldf)
+        win32gui.DeleteObject(hf)
+        win32gui.EndPaint(hwnd, ps)
+
+    def run(self):
+        try:
+            self._build()
+            win32gui.ShowWindow(self.hwnd, win32con.SW_SHOWNOACTIVATE)
+            win32gui.SetWindowPos(
+                self.hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE,
+            )
+            win32gui.SetTimer(self.hwnd, 1, self.duration, None)
+            win32gui.PumpMessages()
+        except Exception as e:
+            print(f"[Toast] 显示失败: {e}")
+        finally:
+            try:
+                if self.hwnd:
+                    win32gui.DestroyWindow(self.hwnd)
+            except Exception:
+                pass
+            try:
+                if self._class_name and self._inst:
+                    win32gui.UnregisterClass(self._class_name, self._inst)
+            except Exception:
+                pass
+
+
+def show_toast(text, duration_ms=1600):
+    """弹出一行轻量提示（不抢焦点，duration 毫秒后自动消失）。
+
+    无 pywin32 时退回控制台打印。
+    """
+    if not HAS_WIN32:
+        print(f"[Toast] {text}")
+        return
+    # 先按字体量出文字尺寸，决定浮层宽高
+    try:
+        hdc = win32gui.GetDC(0)
+        lf = win32gui.LOGFONT()
+        lf.lfHeight = -16
+        lf.lfFaceName = "Microsoft YaHei"
+        hf = win32gui.CreateFontIndirect(lf)
+        old = win32gui.SelectObject(hdc, hf)
+        tw, th = win32gui.GetTextExtentPoint32(hdc, text)
+        win32gui.SelectObject(hdc, old)
+        win32gui.DeleteObject(hf)
+        win32gui.ReleaseDC(0, hdc)
+    except Exception:
+        tw, th = len(text) * 9, 20
+    pad_x, pad_y = 24, 16
+    w = tw + pad_x * 2
+    h = th + pad_y
+    maxw = win32api.GetSystemMetrics(win32con.SM_CXSCREEN) - 40
+    if w > maxw:
+        w = maxw
+    cx = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+    cy = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
+    x = max(20, (cx - w) // 2)
+    y = max(20, cy - h - 80)
+    toast = ToastWindow(text, x, y, w, h, duration_ms)
+    threading.Thread(target=toast.run, daemon=True).start()
 
 
 # ----------------- 核心逻辑 -----------------
@@ -549,15 +747,17 @@ def do_ocr():
 
 def do_region_ocr():
     """区域选择模式：框选多个区域，仅识别区域内容，区域间换行隔开。"""
-    global region_sel
+    global region_sel, _active_mode
     if not _lock.acquire(blocking=False):
         return  # 上一轮还在跑，忽略重复触发
     try:
         mon = get_monitor(MONITOR)
         sel = RegionSelector()
         region_sel = sel
+        _active_mode = "region"
         confirmed, rects = sel.select(mon)
         region_sel = None
+        _active_mode = None
         if not confirmed or not rects:
             return
 
@@ -601,6 +801,96 @@ def do_region_ocr():
         print(f"[区域OCR] 出错: {e}")
     finally:
         region_sel = None
+        _active_mode = None
+        _lock.release()
+
+
+def do_define_preset(slot):
+    """定义模式：框选区域（可多选）后保存到槽位 slot，不立即识别。"""
+    global region_sel, _active_mode, _active_slot
+    if not _lock.acquire(blocking=False):
+        return  # 上一轮还在跑，忽略重复触发
+    try:
+        mon = get_monitor(MONITOR)
+        sel = RegionSelector()
+        region_sel = sel
+        _active_mode = "define"
+        _active_slot = slot
+        # 顶部提示栏显示对应的“再次按此键取消”
+        sel.cancel_hint = DEFINE_HOTKEY_PRETTY_TMPL % slot
+        confirmed, rects = sel.select(mon)
+        region_sel = None
+        _active_mode = None
+        _active_slot = None
+        if not confirmed or not rects:
+            print(f"[定义] 已取消选区 {slot} 的定义。")
+            return
+        name = "选区%d" % slot
+        presets[str(slot)] = {
+            "name": name,
+            "monitor": MONITOR,
+            "rects": [[int(x), int(y), int(w), int(h)] for (x, y, w, h) in rects],
+        }
+        save_presets()
+        print(f"[定义] 已将 {name} 保存到槽位 {slot}（{len(rects)} 个区域），"
+              f"重启后仍保留（见 region_presets.json）。")
+    except Exception as e:
+        print(f"[定义] 出错: {e}")
+    finally:
+        region_sel = None
+        _active_mode = None
+        _active_slot = None
+        _lock.release()
+
+
+def trigger_preset(slot):
+    """触发模式：自动截已存槽位的区域 → OCR → 静默复制到剪贴板（不弹窗）。"""
+    if not _lock.acquire(blocking=False):
+        return  # 上一轮还在跑，忽略重复触发
+    try:
+        key = str(slot)
+        p = presets.get(key)
+        if not p or not p.get("rects"):
+            msg = f"选区 {slot} 未定义，请先 Ctrl+Shift+{slot} 定义"
+            print(f"[触发] {msg}。")
+            show_toast(msg)
+            return
+        name = p.get("name", "选区%d" % slot)
+        mon_index = p.get("monitor", MONITOR)
+
+        # 隐藏结果窗口，避免被截进屏幕
+        result_win.hide()
+
+        t0 = time.time()
+        mon = get_monitor(mon_index)
+        img = grab_monitor(mon)
+        ih, iw = img.shape[:2]
+        parts = []
+        for (x, y, w, h) in p["rects"]:
+            x0 = max(0, int(x)); y0 = max(0, int(y))
+            x1 = min(iw, int(x) + int(w)); y1 = min(ih, int(y) + int(h))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            crop = img[y0:y1, x0:x1]
+            if crop.size == 0:
+                continue
+            t = ocr_image(crop)
+            if t.strip():
+                parts.append(t)
+        text = "\n".join(parts)
+        if text.strip():
+            pyperclip.copy(_crlf(text))
+            dt = (time.time() - t0) * 1000
+            n_lines = len(text.splitlines())
+            print(f"[触发] {name}(槽位{slot})：识别 {n_lines} 行，用时 {dt:.0f}ms，"
+                  f"已静默复制到剪贴板。")
+            show_toast(f"{name}(槽位{slot})：已复制 {n_lines} 行")
+        else:
+            print(f"[触发] {name}(槽位{slot})：未识别到文字。")
+            show_toast(f"{name}(槽位{slot})：未识别到文字")
+    except Exception as e:
+        print(f"[触发] 出错: {e}")
+    finally:
         _lock.release()
 
 
@@ -613,11 +903,31 @@ def on_activate_region():
     if not HAS_WIN32:
         print("[区域] 区域选择模式需要 pywin32（Windows）。已跳过。")
         return
-    # 若已有选择在进行，再次按快捷键 = 取消
-    if region_sel is not None and region_sel.hwnd:
-        win32gui.PostMessage(region_sel.hwnd, WM_REGION_CANCEL, 0, 0)
+    # 若已有“区域模式”框选在进行，再次按快捷键 = 取消
+    if region_sel is not None and getattr(region_sel, "hwnd", None):
+        if _active_mode == "region":
+            win32gui.PostMessage(region_sel.hwnd, WM_REGION_CANCEL, 0, 0)
         return
     threading.Thread(target=do_region_ocr, daemon=True).start()
+
+
+def on_activate_trigger(slot):
+    """触发选区：一键自动截已存区域 → OCR → 静默复制。"""
+    threading.Thread(target=trigger_preset, args=(slot,), daemon=True).start()
+
+
+def on_activate_define(slot):
+    """定义选区：进入框选并把区域存为槽位 slot 的预设。"""
+    global region_sel, _active_mode, _active_slot
+    if not HAS_WIN32:
+        print("[定义] 区域选择模式需要 pywin32（Windows）。已跳过。")
+        return
+    # 若已有“同槽位定义”框选在进行，再次按定义键 = 取消
+    if region_sel is not None and getattr(region_sel, "hwnd", None):
+        if _active_mode == "define" and _active_slot == slot:
+            win32gui.PostMessage(region_sel.hwnd, WM_REGION_CANCEL, 0, 0)
+        return
+    threading.Thread(target=do_define_preset, args=(slot,), daemon=True).start()
 
 
 def on_activate_exit():
@@ -632,25 +942,34 @@ def on_activate_exit():
 
 def main():
     print("=" * 46)
-    print("  屏幕 OCR 客户端（全屏 + 区域多选 · 离线）")
+    print("  屏幕 OCR 客户端（全屏 + 区域多选 + 选区预设 · 离线）")
     print("=" * 46)
+    load_presets()
     print(f"  全屏识别   : {HOTKEY_PRETTY}")
     print(f"  区域选择   : {REGION_HOTKEY_PRETTY}（可框选多个区域）")
     print(f"  退出快捷键 : {EXIT_KEY_PRETTY}")
     print(f"  识别范围   : {'全部显示器' if MONITOR == 0 else '主显示器'}")
     print(f"  自动复制全部 : {'开' if AUTO_COPY_ALL else '关'}")
     print(f"  结果窗口   : {'开' if SHOW_WINDOW and HAS_WIN32 else '关(控制台)'}")
+    print(f"  选区预设   : 定义 {DEFINE_HOTKEY_PRETTY_TMPL % 1}~{DEFINE_HOTKEY_PRETTY_TMPL % PRESET_SLOTS}"
+          f" → 触发 {TRIGGER_HOTKEY_PRETTY_TMPL % 1}~{TRIGGER_HOTKEY_PRETTY_TMPL % PRESET_SLOTS}")
+    print(f"  已存选区   : {len(presets)} 个（见 region_presets.json）")
     print("  全屏模式：按快捷键识别整屏；区域模式：拖拽框选多区域后右键确认。")
+    print("  选区预设：Ctrl+Shift+N 框选存为选区N；之后 Ctrl+Alt+N 一键识别并静默复制。")
     print("  选区中按 Esc 取消选区；待机按 Esc 退出程序。")
     print("=" * 46)
 
     threading.Thread(target=ui_loop, daemon=True).start()
 
-    hotkeys = keyboard.GlobalHotKeys({
+    hotkeys_map = {
         HOTKEY: on_activate_ocr,
         REGION_HOTKEY: on_activate_region,
         EXIT_KEY: on_activate_exit,
-    })
+    }
+    for n in range(1, PRESET_SLOTS + 1):
+        hotkeys_map[TRIGGER_HOTKEY_TMPL % n] = (lambda s=n: on_activate_trigger(s))
+        hotkeys_map[DEFINE_HOTKEY_TMPL % n] = (lambda s=n: on_activate_define(s))
+    hotkeys = keyboard.GlobalHotKeys(hotkeys_map)
     try:
         hotkeys.run()  # 阻塞，直到被 stop / 进程退出
     except KeyboardInterrupt:
