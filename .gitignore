@@ -13,6 +13,7 @@ venv/
 # PyInstaller 构建产物（单文件夹打包输出，体积大、可重构建）
 build/
 dist/
+dist_new/
 
 # 运行时本地数据（用户选区预设，不同机器不一样）
 region_presets.json

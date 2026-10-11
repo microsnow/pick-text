@@ -89,6 +89,109 @@ CLOSE_KEY_PRETTY = _pretty(CLOSE_KEY)
 TRIGGER_HOTKEY_PRETTY_TMPL = "Ctrl+Alt+%d"
 DEFINE_HOTKEY_PRETTY_TMPL = "Ctrl+Shift+%d"
 
+# =================================================
+
+# ----------------- 快捷键配置（可运行时修改，落盘 hotkeys.json） -----------------
+if getattr(sys, "frozen", False):
+    _BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+HOTKEYS_CONFIG_FILE = os.path.join(_BASE_DIR, "hotkeys.json")
+
+DEFAULT_HOTKEYS = {
+    "full": HOTKEY,
+    "region": REGION_HOTKEY,
+    "close": CLOSE_KEY,
+    "trigger_tmpl": TRIGGER_HOTKEY_TMPL,
+    "define_tmpl": DEFINE_HOTKEY_TMPL,
+}
+CFG = dict(DEFAULT_HOTKEYS)   # 当前生效的快捷键配置（运行时可改）
+
+
+def load_hotkey_config():
+    """从 hotkeys.json 读取已保存的快捷键；缺失/损坏则回退默认。"""
+    cfg = dict(DEFAULT_HOTKEYS)
+    try:
+        if os.path.exists(HOTKEYS_CONFIG_FILE):
+            with open(HOTKEYS_CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k in DEFAULT_HOTKEYS:
+                    if k in data and isinstance(data[k], str) and data[k]:
+                        cfg[k] = data[k]
+    except Exception as e:
+        print(f"[快捷键] 读取 {HOTKEYS_CONFIG_FILE} 失败，使用默认: {e}")
+    for k in ("trigger_tmpl", "define_tmpl"):
+        if "%d" not in cfg[k]:
+            cfg[k] = DEFAULT_HOTKEYS[k]
+    return cfg
+
+
+def save_hotkey_config(cfg):
+    """把快捷键配置写回 hotkeys.json。"""
+    try:
+        os.makedirs(os.path.dirname(HOTKEYS_CONFIG_FILE), exist_ok=True)
+        with open(HOTKEYS_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[快捷键] 保存 {HOTKEYS_CONFIG_FILE} 失败: {e}")
+
+
+def apply_config(cfg):
+    """把配置写回全局变量与派生变量，供热键监听与界面显示使用。"""
+    global CFG, HOTKEY, REGION_HOTKEY, CLOSE_KEY
+    global TRIGGER_HOTKEY_TMPL, DEFINE_HOTKEY_TMPL
+    global HOTKEY_PRETTY, REGION_HOTKEY_PRETTY, CLOSE_KEY_PRETTY
+    global TRIGGER_HOTKEY_PRETTY_TMPL, DEFINE_HOTKEY_PRETTY_TMPL
+    CFG = dict(cfg)
+    HOTKEY = CFG["full"]
+    REGION_HOTKEY = CFG["region"]
+    CLOSE_KEY = CFG["close"]
+    TRIGGER_HOTKEY_TMPL = CFG["trigger_tmpl"]
+    DEFINE_HOTKEY_TMPL = CFG["define_tmpl"]
+    HOTKEY_PRETTY = _pretty(HOTKEY)
+    REGION_HOTKEY_PRETTY = _pretty(REGION_HOTKEY)
+    CLOSE_KEY_PRETTY = _pretty(CLOSE_KEY)
+    TRIGGER_HOTKEY_PRETTY_TMPL = _pretty(TRIGGER_HOTKEY_TMPL)
+    DEFINE_HOTKEY_PRETTY_TMPL = _pretty(DEFINE_HOTKEY_TMPL)
+
+
+def build_hotkey_map():
+    """根据当前 CFG 生成 pynput 热键映射表。"""
+    m = {
+        HOTKEY: on_activate_ocr,
+        REGION_HOTKEY: on_activate_region,
+        CLOSE_KEY: on_activate_esc_close,
+    }
+    for n in range(1, PRESET_SLOTS + 1):
+        m[TRIGGER_HOTKEY_TMPL % n] = (lambda s=n: on_activate_trigger(s))
+        m[DEFINE_HOTKEY_TMPL % n] = (lambda s=n: on_activate_define(s))
+    return m
+
+
+def start_hotkey_listener():
+    """停止旧监听并启动新监听（用最新 CFG）。返回 (成功, 错误信息)。"""
+    global _hotkey_listener
+    if _hotkey_listener is not None:
+        try:
+            _hotkey_listener.stop()
+        except Exception:
+            pass
+        _hotkey_listener = None
+    m = build_hotkey_map()
+    try:
+        l = keyboard.GlobalHotKeys(m)
+        l.start()
+        _hotkey_listener = l
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+# 启动时加载已保存配置（覆盖默认）
+_loaded = load_hotkey_config()
+apply_config(_loaded)
+
 
 def _crlf(s):
     """统一转为 Windows 换行符 CRLF（幂等）。
@@ -114,7 +217,7 @@ if HAS_WIN32:
 
 _engine = None
 _lock = threading.Lock()
-HOTKEYS = None   # 全局热键监听器（托盘“退出”需停止它）
+_hotkey_listener = None   # 全局热键监听器（托盘"退出"需停止它）
 
 # 当前活动的区域选择器（供全局热键“取消”使用）
 region_sel = None
@@ -385,6 +488,10 @@ class ResultWindow:
                 print("[UI] 关于弹窗已关闭。")
             except Exception as e:
                 print(f"[UI] 关于弹窗异常: {e}")
+            return 0
+        if msg == WM_HOTKEY_SETTINGS_SHOW:
+            # 在 UI 线程弹出「快捷键设置」弹层（嵌套消息循环），托盘回调立即返回。
+            open_hotkey_settings(self.hwnd)
             return 0
         if msg == win32con.WM_COMMAND:
             ctrl_id = wparam & 0xFFFF
@@ -908,6 +1015,7 @@ def do_region_ocr():
     try:
         mon = get_monitor(MONITOR)
         sel = RegionSelector()
+        sel.cancel_hint = REGION_HOTKEY_PRETTY   # 顶部提示栏跟随当前配置
         region_sel = sel
         _active_mode = "region"
         confirmed, rects = sel.select(mon)
@@ -1006,7 +1114,7 @@ def trigger_preset(slot):
         key = str(slot)
         p = presets.get(key)
         if not p or not p.get("rects"):
-            msg = f"选区 {slot} 未定义，请先 Ctrl+Shift+{slot} 定义"
+            msg = f"选区 {slot} 未定义，请先 {DEFINE_HOTKEY_PRETTY_TMPL % slot} 定义"
             print(f"[触发] {msg}。")
             show_toast(msg)
             return
@@ -1175,10 +1283,10 @@ def show_about():
 
 
 def on_tray_exit(icon, item):
-    """托盘“退出”：停止热键监听与托盘图标，干净退出。"""
+    """托盘"退出"：停止热键监听与托盘图标，干净退出。"""
     try:
-        if HOTKEYS is not None:
-            HOTKEYS.stop()
+        if _hotkey_listener is not None:
+            _hotkey_listener.stop()
     except Exception:
         pass
     try:
@@ -1198,6 +1306,7 @@ def run_tray():
             build_tray_icon_image(),
             "屏幕OCR（离线）",
             menu=pystray.Menu(
+                pystray.MenuItem("快捷键设置...", open_hotkey_settings_from_tray),
                 pystray.MenuItem("关于 / 快捷键", show_about),
                 pystray.MenuItem("退出", on_tray_exit),
             ),
@@ -1205,6 +1314,384 @@ def run_tray():
         icon.run()
     except Exception as e:
         print(f"[托盘] 启动失败，退回无托盘模式: {e}")
+
+
+# ----------------- 快捷键设置弹层（系统托盘 → 原生对话框） -----------------
+# 弹层由 UI 线程（result_win 所属线程）以嵌套消息循环弹出，避免阻塞托盘回调。
+if HAS_WIN32:
+    WM_HOTKEY_SETTINGS_SHOW = win32con.WM_APP + 5  # 由 UI 线程弹出设置弹层
+else:
+    WM_HOTKEY_SETTINGS_SHOW = 0
+
+
+def vk_to_pynput(vk):
+    """把当前按下的按键（含修饰键状态）转成 pynput 热键字符串。
+
+    返回 (combo_str, main_key)；main_key 为 None 表示不支持的按键。
+    """
+    ctrl = (win32api.GetKeyState(win32con.VK_CONTROL) & 0x8000) != 0
+    alt = (win32api.GetKeyState(win32con.VK_MENU) & 0x8000) != 0
+    shift = (win32api.GetKeyState(win32con.VK_SHIFT) & 0x8000) != 0
+    parts = []
+    if ctrl:
+        parts.append("<ctrl>")
+    if alt:
+        parts.append("<alt>")
+    if shift:
+        parts.append("<shift>")
+    main = None
+    if 0x30 <= vk <= 0x39:
+        main = chr(vk)                # 0-9
+    elif 0x41 <= vk <= 0x5A:
+        main = chr(vk).lower()        # A-Z
+    elif vk == win32con.VK_ESCAPE:
+        main = "<esc>"
+    elif vk == win32con.VK_SPACE:
+        main = "<space>"
+    elif vk == win32con.VK_TAB:
+        main = "<tab>"
+    elif vk == win32con.VK_RETURN:
+        main = "<enter>"
+    elif win32con.VK_F1 <= vk <= win32con.VK_F12:
+        main = "f" + str(vk - win32con.VK_F1 + 1)
+    combo = "+".join(parts + [main]) if main else None
+    return combo, main
+
+
+def _find_hotkey_conflicts(cfg):
+    """返回冲突项 {热键字符串: [动作名, ...]}（同一组合被多个动作占用）。"""
+    items = [("全屏识别", cfg["full"]),
+             ("区域选择", cfg["region"]),
+             ("关闭/取消", cfg["close"])]
+    for n in range(1, PRESET_SLOTS + 1):
+        items.append((f"选区触发{n}", cfg["trigger_tmpl"] % n))
+        items.append((f"选区定义{n}", cfg["define_tmpl"] % n))
+    by = {}
+    for name, hk in items:
+        if not hk:
+            continue
+        by.setdefault(hk, []).append(name)
+    return {hk: ns for hk, ns in by.items() if len(ns) > 1}
+
+
+_settings_open = False
+
+
+def open_hotkey_settings(owner_hwnd):
+    """在 UI 线程弹出「快捷键设置」弹层（嵌套消息循环）。"""
+    global _settings_open
+    if _settings_open:
+        return  # 防止重复打开
+    if not HAS_WIN32:
+        print("[设置] 需要 pywin32（Windows）才能打开设置窗口。")
+        return
+    _settings_open = True
+    try:
+        dlg = HotkeySettingsDialog(owner_hwnd)
+        dlg.run()
+    except Exception as e:
+        print(f"[设置] 打开失败: {e}")
+    finally:
+        _settings_open = False
+
+
+def open_hotkey_settings_from_tray(icon, item):
+    """托盘菜单回调：把打开请求转交 UI 线程（PostMessage），立即返回。"""
+    if result_win is not None and result_win.ready and result_win.hwnd:
+        win32gui.PostMessage(result_win.hwnd, WM_HOTKEY_SETTINGS_SHOW, 0, 0)
+    else:
+        print("[设置] 结果窗口尚未就绪，无法打开快捷键设置。")
+
+
+class HotkeySettingsDialog:
+    """系统托盘「快捷键设置」弹层：可录制并修改各项快捷键，
+    实时检测冲突并提示；保存时再次校验，冲突则阻止。"""
+
+    # (配置键, 显示名, 是否模板(以 1-9 结尾))
+    ITEMS = [
+        ("full", "全屏识别", False),
+        ("region", "区域选择", False),
+        ("close", "关闭/取消", False),
+        ("trigger_tmpl", "选区触发 (1-9)", True),
+        ("define_tmpl", "选区定义 (1-9)", True),
+    ]
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.hwnd = None
+        self.edits = {}
+        self.record_btns = {}
+        self.status = None
+        self.values = dict(CFG)
+        self.recording = None
+        self._inst = None
+        self._atom = None
+
+    def _display(self, key):
+        v = self.values[key]
+        if key in ("trigger_tmpl", "define_tmpl"):
+            return _pretty(v % 1) + "  (1-9)"
+        return _pretty(v)
+
+    def _set_status(self, text):
+        try:
+            win32gui.SendMessage(self.status, win32con.WM_SETTEXT, 0, text)
+        except Exception:
+            pass
+
+    def _refresh_conflict(self):
+        c = _find_hotkey_conflicts(self.values)
+        if not c:
+            self._set_status("未检测到冲突。修改后点「确定」即可即时生效。")
+        else:
+            parts = [f"{_pretty(hk)}  →  {'、'.join(ns)}" for hk, ns in c.items()]
+            self._set_status("⚠ 快捷键冲突：\n" + "\n".join(parts)
+                             + "\n（保存时会被阻止，请先修改）")
+
+    def _refresh_edit(self, key):
+        try:
+            win32gui.SendMessage(self.edits[key], win32con.WM_SETTEXT, 0,
+                                 self._display(key))
+        except Exception:
+            pass
+
+    def build(self):
+        self._inst = win32api.GetModuleHandle(None)
+        wc = win32gui.WNDCLASS()
+        wc.hInstance = self._inst
+        wc.lpszClassName = "OCRHotkeySettingsDlg"
+        wc.lpfnWndProc = self._wndproc
+        wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
+        wc.hbrBackground = win32con.COLOR_BTNFACE + 1
+        self._atom = win32gui.RegisterClass(wc)
+
+        w, h = 520, 530
+        cx = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+        x = max(0, (cx - w) // 2)
+        y = 110
+        style = win32con.WS_POPUP | win32con.WS_CAPTION | win32con.WS_SYSMENU
+        self.hwnd = win32gui.CreateWindow(
+            self._atom, "快捷键设置", style,
+            x, y, w, h, self.owner or 0, 0, self._inst, None,
+        )
+        self.header = win32gui.CreateWindow(
+            "STATIC",
+            "点击「录制」后按下新快捷键；再点一次「录制」可取消。冲突会立即提示。",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.SS_LEFT,
+            16, 12, w - 32, 40, self.hwnd, 10, self._inst, None,
+        )
+
+        row_h = 54
+        top = 60
+        self.labels = []
+        for i, (key, name, _t) in enumerate(self.ITEMS):
+            ry = top + i * row_h
+            lbl = win32gui.CreateWindow(
+                "STATIC", name,
+                win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.SS_LEFT,
+                16, ry + 6, 150, 24, self.hwnd, 100 + i, self._inst, None,
+            )
+            self.labels.append(lbl)
+            e = win32gui.CreateWindow(
+                "EDIT", self._display(key),
+                win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.WS_BORDER
+                | win32con.ES_READONLY,
+                172, ry + 4, 208, 26, self.hwnd, 200 + i, self._inst, None,
+            )
+            self.edits[key] = e
+            b = win32gui.CreateWindow(
+                "BUTTON", "录制",
+                win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
+                392, ry + 4, 112, 26, self.hwnd, 300 + i, self._inst, None,
+            )
+            self.record_btns[key] = b
+
+        status_y = top + len(self.ITEMS) * row_h + 4
+        self.status = win32gui.CreateWindow(
+            "EDIT", "",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.WS_BORDER
+            | win32con.WS_VSCROLL | win32con.ES_MULTILINE
+            | win32con.ES_AUTOVSCROLL | win32con.ES_READONLY,
+            16, status_y, w - 32, 96, self.hwnd, 900, self._inst, None,
+        )
+        btn_y = status_y + 106
+        win32gui.CreateWindow(
+            "BUTTON", "恢复默认",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
+            16, btn_y, 110, 32, self.hwnd, 903, self._inst, None,
+        )
+        win32gui.CreateWindow(
+            "BUTTON", "取消",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
+            w - 220, btn_y, 100, 32, self.hwnd, 902, self._inst, None,
+        )
+        win32gui.CreateWindow(
+            "BUTTON", "确定",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON
+            | win32con.BS_DEFPUSHBUTTON,
+            w - 110, btn_y, 94, 32, self.hwnd, 901, self._inst, None,
+        )
+
+        # 中文字体
+        try:
+            lf = win32gui.LOGFONT()
+            lf.lfHeight = -15
+            lf.lfFaceName = "Microsoft YaHei"
+            hf = win32gui.CreateFontIndirect(lf)
+            ctrls = (list(self.edits.values()) + list(self.record_btns.values())
+                     + list(getattr(self, "labels", [])))
+            ctrls.append(self.status)
+            if getattr(self, "header", None):
+                ctrls.append(self.header)
+            for hw in ctrls:
+                win32gui.SendMessage(hw, win32con.WM_SETFONT, hf, 1)
+        except Exception:
+            pass
+
+        self._refresh_conflict()
+
+    def _begin_record(self, key):
+        self.recording = key
+        try:
+            win32gui.SetWindowText(self.record_btns[key], "停止")
+        except Exception:
+            pass
+        try:
+            _bring_to_front(self.hwnd)
+        except Exception:
+            pass
+        try:
+            win32gui.SetFocus(self.hwnd)  # 关键：焦点给对话框本身才能收到 WM_KEYDOWN
+        except Exception:
+            pass
+        self._set_status("请按下新的快捷键组合…（再点「停止」可取消）")
+
+    def _end_record(self, cancelled=False):
+        if self.recording is None:
+            return
+        key = self.recording
+        self.recording = None
+        try:
+            win32gui.SetWindowText(self.record_btns[key], "录制")
+        except Exception:
+            pass
+        if not cancelled:
+            self._refresh_edit(key)
+            self._refresh_conflict()
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == win32con.WM_COMMAND:
+            cid = wparam & 0xFFFF
+            if 300 <= cid < 300 + len(self.ITEMS):
+                key = self.ITEMS[cid - 300][0]
+                if self.recording == key:
+                    self._end_record(cancelled=True)
+                else:
+                    if self.recording is not None:
+                        self._end_record(cancelled=True)
+                    self._begin_record(key)
+                return 0
+            if cid == 901:
+                self._on_ok()
+                return 0
+            if cid == 902:
+                self._close()
+                return 0
+            if cid == 903:
+                self.values = dict(DEFAULT_HOTKEYS)
+                for k in self.edits:
+                    self._refresh_edit(k)
+                self._refresh_conflict()
+                self._set_status("已恢复默认快捷键，点「确定」保存生效。")
+                return 0
+            return 0
+        if msg == win32con.WM_KEYDOWN:
+            if self.recording is not None:
+                vk = wparam
+                # 忽略单独的修饰键，等待主键
+                if vk in (win32con.VK_CONTROL, win32con.VK_MENU,
+                          win32con.VK_SHIFT):
+                    return 0
+                combo, main = vk_to_pynput(vk)
+                key = self.recording
+                is_tmpl = dict((k, t) for k, _, t in self.ITEMS)[key]
+                if combo is None:
+                    self._end_record(cancelled=True)
+                    self._set_status("⚠ 该按键暂不支持，请换一个组合"
+                                     "（如 Ctrl+Alt+字母/数字）。")
+                    return 0
+                if is_tmpl:
+                    if main not in "123456789":
+                        self._end_record(cancelled=True)
+                        self._set_status("⚠ 选区快捷键需以数字 1-9 结尾"
+                                         "（用于区分槽位），请重录。")
+                        return 0
+                    combo = combo.rsplit("+", 1)[0] + "+%d"
+                self.values[key] = combo
+                self._end_record()
+                return 0
+        if msg == win32con.WM_CLOSE:
+            self._close()
+            return 0
+        if msg == win32con.WM_DESTROY:
+            return 0
+        return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+    def _on_ok(self):
+        # 保存前最终冲突校验
+        conflicts = _find_hotkey_conflicts(self.values)
+        if conflicts:
+            parts = [f"• {_pretty(hk)} ：{'、'.join(ns)}"
+                     for hk, ns in conflicts.items()]
+            msg = ("检测到以下快捷键冲突，请修改后再保存：\n\n"
+                   + "\n".join(parts))
+            win32gui.MessageBox(
+                self.hwnd, msg, "快捷键冲突",
+                win32con.MB_OK | win32con.MB_ICONWARNING | win32con.MB_TOPMOST,
+            )
+            return
+        # 应用并即时生效
+        old = dict(CFG)
+        apply_config(self.values)
+        ok, err = start_hotkey_listener()
+        if not ok:
+            # 注册失败（可能被系统/其它软件占用），回退到原设置
+            apply_config(old)
+            win32gui.MessageBox(
+                self.hwnd,
+                f"新快捷键注册失败，已恢复原有设置。\n原因：{err}",
+                "注册失败",
+                win32con.MB_OK | win32con.MB_ICONERROR | win32con.MB_TOPMOST,
+            )
+            return
+        save_hotkey_config(self.values)
+        show_toast("快捷键已更新并生效")
+        self._close()
+
+    def _close(self):
+        try:
+            if self.hwnd:
+                win32gui.DestroyWindow(self.hwnd)
+        except Exception:
+            pass
+        try:
+            win32gui.PostQuitMessage(0)
+        except Exception:
+            pass
+
+    def run(self):
+        self.build()
+        win32gui.ShowWindow(self.hwnd, win32con.SW_SHOW)
+        try:
+            _bring_to_front(self.hwnd)
+        except Exception:
+            pass
+        win32gui.PumpMessages()  # 嵌套消息循环，直到 DestroyWindow + PostQuitMessage
+        try:
+            if self._atom is not None and self._inst is not None:
+                win32gui.UnregisterClass("OCRHotkeySettingsDlg", self._inst)
+        except Exception:
+            pass
 
 
 def main():
@@ -1250,19 +1737,12 @@ def main():
     if tray_mode and HAS_TRAY:
         threading.Thread(target=run_tray, daemon=True).start()
 
-    hotkeys_map = {
-        HOTKEY: on_activate_ocr,
-        REGION_HOTKEY: on_activate_region,
-        CLOSE_KEY: on_activate_esc_close,
-    }
-    for n in range(1, PRESET_SLOTS + 1):
-        hotkeys_map[TRIGGER_HOTKEY_TMPL % n] = (lambda s=n: on_activate_trigger(s))
-        hotkeys_map[DEFINE_HOTKEY_TMPL % n] = (lambda s=n: on_activate_define(s))
-    hotkeys = keyboard.GlobalHotKeys(hotkeys_map)
-    global HOTKEYS
-    HOTKEYS = hotkeys
+    # 启动全局热键监听（独立线程，支持运行时重载）
+    start_hotkey_listener()
+    # 主线程保持运行，等待托盘退出（Ctrl+C 亦可直接结束）
     try:
-        hotkeys.run()  # 阻塞，直到被 stop / 进程退出
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         pass
     os._exit(0)
