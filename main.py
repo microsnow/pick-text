@@ -5,19 +5,19 @@
 =================================================
 两种识别模式（均离线，OCR 引擎使用 RapidOCR / ONNX 推理）：
 
-1) 全屏识别（默认快捷键 Ctrl+Alt+O）
+1) 全屏识别（默认快捷键 Win+Alt+O）
    - 抓取整个屏幕，识别其中全部文字，自动复制到剪贴板。
    - 弹出原生结果窗口：可鼠标框选部分文字后 Ctrl+C 进行“选择复制”；
      也可点“复制全部”按钮复制整段。
 
-2) 区域选择识别（默认快捷键 Ctrl+Alt+R）★新增
+2) 区域选择识别（默认快捷键 Win+Alt+R）★新增
    - 屏幕变暗，鼠标左键拖拽即可框选一个区域；可多次拖拽框选多个区域。
 - 右键 / Enter 确认：仅识别各区域中的内容，多个区域之间用换行隔开。
-- 再次按 Ctrl+Alt+R 重选/取消本次选择；ESC 取消选区（不退出程序）。
+- 再次按 Win+Alt+R 重选/取消本次选择；ESC 取消选区（不退出程序）。
 
-3) 选区预设（快捷键 Ctrl+Shift+1~9 定义 / Ctrl+Alt+1~9 触发）★新增
-   - 用 Ctrl+Shift+N 框选并把屏幕某块区域“存”为命名选区（落盘到 region_presets.json）。
-   - 之后按 Ctrl+Alt+N 一键自动截该区域 → OCR → 静默复制到剪贴板，无需每次重画。
+3) 选区预设（快捷键 Win+Shift+1~9 定义 / Win+Alt+1~9 触发）★新增
+   - 用 Win+Shift+N 框选并把屏幕某块区域“存”为命名选区（落盘到 region_presets.json）。
+   - 之后按 Win+Alt+N 一键自动截该区域 → OCR → 静默复制到剪贴板，无需每次重画。
    - 适合反复取同一处固定文字（字幕条、计时器、比分牌、表单框等）。
 
 依赖：mss / rapidocr-onnxruntime / pynput / pyperclip / numpy / pywin32
@@ -44,10 +44,17 @@ try:
     import win32gui
     import win32con
     import win32api
+    import pywintypes
     HAS_WIN32 = True
 except Exception as _e:  # 无 pywin32 时退回控制台输出
     HAS_WIN32 = False
     print(f"[提示] 未检测到 pywin32（{_e}），区域选择等 GUI 功能将不可用。")
+
+try:
+    import win32file
+    HAS_WIN32FILE = True
+except Exception:
+    HAS_WIN32FILE = False
 
 # 系统托盘（桌面应用形态）：包装成常驻后台、右下角图标的“正式”程序
 try:
@@ -59,8 +66,11 @@ except Exception as _te:
     print(f"[提示] 未检测到 pystray/PIL（{_te}），将不显示系统托盘图标。")
 
 # ===================== 配置区 =====================
-HOTKEY = "<ctrl>+<alt>+o"   # 全屏识别快捷键
-REGION_HOTKEY = "<ctrl>+<alt>+r"  # 区域选择识别快捷键（可多选区域）
+# 热键采用 OS 独占注册（Win32 RegisterHotKey），冲突会被精确检测并提示。
+# 默认值经实测调校，避开本机已被占用的「Win+数字」系列（某窗口/启动类工具占用了整套
+# Win+digit 组合）：固定键用 Win+字母（空闲），槽位键用 Ctrl/Alt+Shift+数字（空闲且冲突面小）。
+HOTKEY = "<cmd>+<alt>+o"   # 全屏识别快捷键：Win+Alt+O
+REGION_HOTKEY = "<cmd>+<alt>+q"  # 区域选择识别快捷键（可多选区域）：Win+Alt+Q（R 已被占用）
 MONITOR = 1                 # 1 = 主显示器；0 = 全部显示器（拼接大图，较慢）
 AUTO_COPY_ALL = True        # OCR 后自动复制全部到剪贴板（一键复制全部）
 SHOW_WINDOW = True          # 是否弹出结果窗口（支持框选复制）
@@ -71,13 +81,16 @@ CLOSE_KEY = "<esc>"          # 关闭/取消“当前弹窗”（结果窗口或
 # 把屏幕上某块区域“存”成预设，绑定快捷键；之后一键自动截该区域→OCR→静默复制。
 PRESET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "region_presets.json")
 PRESET_SLOTS = 9            # 支持 1~9 号槽位
+# 定义槽位始终注册（用来创建预设）；触发槽位仅在已存预设时注册（见 build_hotkey_map）。
+# 注意：槽位键不用 Win+数字（本机该系列已被占用），改用 Ctrl+Shift / Alt+Shift + 数字。
 DEFINE_HOTKEY_TMPL = "<ctrl>+<shift>+%d"    # 定义选区：Ctrl+Shift+1..9
-TRIGGER_HOTKEY_TMPL = "<ctrl>+<alt>+%d"     # 触发选区：Ctrl+Alt+1..9
+TRIGGER_HOTKEY_TMPL = "<alt>+<shift>+%d"     # 触发选区：Alt+Shift+1..9
 # =================================================
 
 # 给界面显示用的人类可读快捷键
 def _pretty(hk):
-    return (hk.replace("<ctrl>", "Ctrl")
+    return (hk.replace("<cmd>", "Win")
+             .replace("<ctrl>", "Ctrl")
              .replace("<alt>", "Alt")
              .replace("<shift>", "Shift")
              .replace("<esc>", "Esc")
@@ -86,7 +99,7 @@ def _pretty(hk):
 HOTKEY_PRETTY = _pretty(HOTKEY)
 REGION_HOTKEY_PRETTY = _pretty(REGION_HOTKEY)
 CLOSE_KEY_PRETTY = _pretty(CLOSE_KEY)
-TRIGGER_HOTKEY_PRETTY_TMPL = "Ctrl+Alt+%d"
+TRIGGER_HOTKEY_PRETTY_TMPL = "Alt+Shift+%d"
 DEFINE_HOTKEY_PRETTY_TMPL = "Ctrl+Shift+%d"
 
 # =================================================
@@ -157,35 +170,188 @@ def apply_config(cfg):
 
 
 def build_hotkey_map():
-    """根据当前 CFG 生成 pynput 热键映射表。"""
+    """根据当前 CFG 生成“可注册热键映射表”（用于 Win32 RegisterHotKey）。
+
+    为减少与其它软件的全局热键冲突，触发槽位仅在「已存预设」时注册：
+    未定义过的槽位不会占用全局热键，定义后才即时启用（见 do_define_preset）。
+    定义槽位始终注册（用于创建预设）。
+
+    注意：关闭/取消键（如 <esc>）是无修饰键的“裸键”，RegisterHotKey 不允许注册，
+    由独立的 Esc 钩子（见 start_esc_listener）处理；若关闭键含修饰键则一并注册。
+    """
     m = {
         HOTKEY: on_activate_ocr,
         REGION_HOTKEY: on_activate_region,
-        CLOSE_KEY: on_activate_esc_close,
     }
+    # 关闭键：含修饰键才能注册；裸键（Esc 等）由 Esc 钩子负责
+    try:
+        _parse_hotkey(CLOSE_KEY)
+        m[CLOSE_KEY] = on_activate_esc_close
+    except Exception:
+        pass
     for n in range(1, PRESET_SLOTS + 1):
-        m[TRIGGER_HOTKEY_TMPL % n] = (lambda s=n: on_activate_trigger(s))
         m[DEFINE_HOTKEY_TMPL % n] = (lambda s=n: on_activate_define(s))
+        if str(n) in presets:   # 仅对已存预设的槽位注册触发热键
+            m[TRIGGER_HOTKEY_TMPL % n] = (lambda s=n: on_activate_trigger(s))
     return m
 
 
-def start_hotkey_listener():
-    """停止旧监听并启动新监听（用最新 CFG）。返回 (成功, 错误信息)。"""
-    global _hotkey_listener
-    if _hotkey_listener is not None:
+# ----------------- Esc 关闭/取消键：独立键盘钩子 -----------------
+# RegisterHotKey 无法注册“裸键”（无修饰键），而用户常用的“按 Esc 关闭/取消当前弹窗”
+# 正是裸键。这里用一个轻量键盘钩子只监听 Esc，复用 pynput；钩子非独占，但回调仅在
+# 本程序有活动窗口时才动作（on_activate_esc_close 内部已判断），与其它软件共存无碍。
+_esc_listener = None
+
+
+def _on_esc_press(key):
+    try:
+        if key == keyboard.Key.esc:
+            on_activate_esc_close()
+    except Exception as e:
+        print(f"[Esc] 回调异常: {e}")
+
+
+def start_esc_listener():
+    """启动 Esc 钩子（仅当关闭键为裸键时才有意义；始终启动以覆盖默认 <esc>）。"""
+    global _esc_listener
+    if _esc_listener is not None:
+        return
+    try:
+        _esc_listener = keyboard.Listener(on_press=_on_esc_press)
+        _esc_listener.start()
+    except Exception as e:
+        print(f"[Esc] 监听器启动失败（Esc 关闭功能将不可用）: {e}")
+
+
+def stop_esc_listener():
+    global _esc_listener
+    if _esc_listener is not None:
         try:
-            _hotkey_listener.stop()
+            _esc_listener.stop()
         except Exception:
             pass
-        _hotkey_listener = None
-    m = build_hotkey_map()
-    try:
-        l = keyboard.GlobalHotKeys(m)
-        l.start()
-        _hotkey_listener = l
-        return True, ""
-    except Exception as e:
-        return False, str(e)
+        _esc_listener = None
+
+
+def _parse_hotkey(hk):
+    """把 pynput 风格热键串（如 '<cmd>+<alt>+o'）解析为 (mods, vk)。
+
+    返回 win32 MOD_* 修饰符与虚拟键码；解析失败抛 ValueError。
+    """
+    mods = 0
+    vk = None
+    for p in hk.split("+"):
+        pl = p.strip().lower().strip("<>")
+        if pl == "ctrl":
+            mods |= win32con.MOD_CONTROL
+        elif pl == "alt":
+            mods |= win32con.MOD_ALT
+        elif pl == "shift":
+            mods |= win32con.MOD_SHIFT
+        elif pl in ("cmd", "win"):
+            mods |= win32con.MOD_WIN
+        elif pl == "esc":
+            vk = win32con.VK_ESCAPE
+        elif pl == "space":
+            vk = win32con.VK_SPACE
+        elif pl == "tab":
+            vk = win32con.VK_TAB
+        elif pl == "enter":
+            vk = win32con.VK_RETURN
+        elif pl.startswith("f") and pl[1:].isdigit():
+            n = int(pl[1:])
+            if 1 <= n <= 24:
+                vk = getattr(win32con, "VK_F%d" % n)
+        elif len(pl) == 1:
+            code = win32api.VkKeyScan(pl)
+            if code & 0xFFFF == 0xFFFF:
+                raise ValueError("无法识别按键: " + p)
+            vk = code & 0xFF
+        else:
+            raise ValueError("不支持的按键: " + p)
+    if vk is None:
+        raise ValueError("缺少主键（组合键需含一个非修饰键）: " + hk)
+    if mods == 0:
+        raise ValueError("缺少修饰键（系统不允许注册无修饰键的组合）: " + hk)
+    return mods, vk
+
+
+def _hk_name_map():
+    """返回 {hk_str: 动作名} 便于冲突提示。"""
+    items = [("全屏识别", CFG["full"]),
+             ("区域选择", CFG["region"]),
+             ("关闭/取消", CFG["close"])]
+    for n in range(1, PRESET_SLOTS + 1):
+        items.append((f"选区定义{n}", CFG["define_tmpl"] % n))
+        if str(n) in presets:
+            items.append((f"选区触发{n}", CFG["trigger_tmpl"] % n))
+    m = {}
+    for name, hk in items:
+        if hk:
+            m.setdefault(hk, name)
+    return m
+
+
+def _register_hotkeys(hotkey_map):
+    """在 result_win 上（重新）注册全部热键，返回失败项 [(hk, reason)]。
+
+    先卸载旧注册；冲突/占用会被 RegisterHotKey 抛 pywintypes.error(1409) 捕获。
+    """
+    global _hotkey_ids, _hotkey_callbacks
+    if result_win is not None and result_win.hwnd:
+        for hid in _hotkey_ids:
+            try:
+                win32gui.UnregisterHotKey(result_win.hwnd, hid)
+            except Exception:
+                pass
+    _hotkey_ids = []
+    _hotkey_callbacks = {}
+    failures = []
+    for hk, cb in hotkey_map.items():
+        try:
+            mods, vk = _parse_hotkey(hk)
+        except Exception as e:
+            failures.append((hk, "解析失败: %s" % e))
+            continue
+        hid = len(_hotkey_ids) + 1
+        try:
+            win32gui.RegisterHotKey(result_win.hwnd, hid,
+                                    mods | win32con.MOD_NOREPEAT, vk)
+        except pywintypes.error as e:
+            failures.append((hk, "被其它程序或系统占用（WinError %d）" % e.winerror))
+        else:
+            _hotkey_ids.append(hid)
+            _hotkey_callbacks[hid] = cb
+    return failures
+
+
+def start_hotkey_listener():
+    """（在 UI 线程）注册全部热键。返回 (ok, failures)。
+
+    failures 为 [(hk_pretty, 动作名, 原因)]，空列表表示全部成功。
+    需在 result_win 已 build 之后调用（应在 UI 线程）。
+    """
+    if not HAS_WIN32 or result_win is None or not result_win.hwnd:
+        return False, [("（窗口未就绪）", "热键", "UI 窗口尚未创建")]
+    hmap = build_hotkey_map()
+    failures = _register_hotkeys(hmap)
+    namemap = _hk_name_map()
+    detailed = [(_pretty(hk), namemap.get(hk, "（未知）"), reason)
+                for (hk, reason) in failures]
+    return (len(failures) == 0, detailed)
+
+
+def stop_hotkey_listener():
+    """卸载全部已注册热键（退出时调用）。"""
+    global _hotkey_ids, _hotkey_callbacks
+    if result_win is not None and result_win.hwnd:
+        for hid in _hotkey_ids:
+            try:
+                win32gui.UnregisterHotKey(result_win.hwnd, hid)
+            except Exception:
+                pass
+    _hotkey_ids = []
+    _hotkey_callbacks = {}
 
 
 # 启动时加载已保存配置（覆盖默认）
@@ -215,9 +381,17 @@ def _is_cjk(ch):
 if HAS_WIN32:
     WM_REGION_CANCEL = win32con.WM_APP + 1  # 用于“再次按快捷键取消”的自定义消息
 
-_engine = None
 _lock = threading.Lock()
-_hotkey_listener = None   # 全局热键监听器（托盘"退出"需停止它）
+
+# 全局热键（基于 Win32 RegisterHotKey 的 OS 独占注册）：
+# - _hotkey_ids        : 本次已注册的 id 列表（用于卸载）
+# - _hotkey_callbacks  : id -> 回调函数
+# 注册必须在“拥有 result_win 的 UI 线程”进行；WM_HOTKEY 由 UI 线程的消息泵派发到
+# ResultWindow._wndproc，再在此处查表回调。这样系统保证同一组合键只归本程序，
+# 被其它程序/系统占用时 RegisterHotKey 会抛 1409，可精确报冲突。
+_hotkey_ids = []
+_hotkey_callbacks = {}
+_pending_conflict_msg = ""   # 启动时的冲突提示文本，由 UI 线程弹窗读取
 
 # 当前活动的区域选择器（供全局热键“取消”使用）
 region_sel = None
@@ -315,6 +489,9 @@ def grab_monitor(mon):
 WM_RESULT_SHOW = win32con.WM_APP + 2   # 由窗口所属线程执行“显示”（线程安全）
 WM_RESULT_HIDE = win32con.WM_APP + 3   # 由窗口所属线程执行“隐藏/关闭”
 WM_ABOUT_SHOW = win32con.WM_APP + 4    # 由窗口所属线程弹出“关于”模态框（线程安全）
+WM_HOTKEY_RELOAD = win32con.WM_APP + 6  # 请求 UI 线程重新注册全局热键（跨线程安全）
+WM_HOTKEY_CONFLICT_SHOW = win32con.WM_APP + 7  # 启动后弹“热键冲突”提示
+WM_LOG_VIEW_SHOW = win32con.WM_APP + 8  # 由 UI 线程弹出“运行日志”查看窗口
 
 
 def _about_text():
@@ -323,7 +500,7 @@ def _about_text():
         "屏幕 OCR 客户端（离线）\n\n"
         f"全屏识别 : {HOTKEY_PRETTY}\n"
         f"区域选择 : {REGION_HOTKEY_PRETTY}\n\n"
-        "选区预设 : 定义 Ctrl+Shift+1~9 → 触发 Ctrl+Alt+1~9\n\n"
+        "选区预设 : 定义 Ctrl+Shift+1~9 → 触发 Alt+Shift+1~9\n\n"
         "关闭弹窗 : 按 Esc（或点结果窗口的“关闭”/X；选区中按 Esc 取消选区）\n"
         "退出程序 : 右键托盘图标 → 退出（仅此一种方式）"
     )
@@ -458,6 +635,37 @@ class ResultWindow:
         self.ready = True
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == win32con.WM_HOTKEY:
+            # 全局快捷键由系统派发到本窗口：查表调用对应回调
+            cb = _hotkey_callbacks.get(wparam)
+            if cb:
+                try:
+                    cb()
+                except Exception as e:
+                    print(f"[热键] 回调异常: {e}")
+            return 0
+        if msg == WM_HOTKEY_RELOAD:
+            # 跨线程（如定义预设后）请求在 UI 线程重新注册热键
+            try:
+                ok, failures = start_hotkey_listener()
+                if not ok:
+                    for hk, name, reason in failures:
+                        print(f"[热键] 重新注册失败 {hk}（{name}）: {reason}")
+            except Exception as e:
+                print(f"[热键] 重新注册异常: {e}")
+            return 0
+        if msg == WM_HOTKEY_CONFLICT_SHOW:
+            txt = _pending_conflict_msg
+            if txt:
+                try:
+                    win32gui.MessageBox(
+                        self.hwnd, txt, "快捷键冲突（启动）",
+                        win32con.MB_OK | win32con.MB_ICONWARNING
+                        | win32con.MB_SETFOREGROUND | win32con.MB_TOPMOST,
+                    )
+                except Exception as e:
+                    print(f"[UI] 冲突提示异常: {e}")
+            return 0
         if msg == WM_RESULT_SHOW:
             # 在窗口所属线程中执行“显示”，避免跨线程操作 Win32 窗口导致无法交互/无法关闭
             try:
@@ -479,19 +687,15 @@ class ResultWindow:
             # 在窗口所属线程（ui_loop）中以本窗口为 owner 弹出原生模态消息框：
             # 确定按钮 / Esc 的关闭完全由 OS 模态循环接管，不再在托盘线程里
             # 直接调 MessageBox（那是在 pystray 回调栈内阻塞，导致弹窗关不掉）。
-            try:
-                win32gui.MessageBox(
-                    self.hwnd, _about_text(), "关于 · 屏幕OCR",
-                    win32con.MB_OK | win32con.MB_ICONINFORMATION
-                    | win32con.MB_SETFOREGROUND | win32con.MB_TOPMOST,
-                )
-                print("[UI] 关于弹窗已关闭。")
-            except Exception as e:
-                print(f"[UI] 关于弹窗异常: {e}")
+            _show_about_modal(self.hwnd)
             return 0
         if msg == WM_HOTKEY_SETTINGS_SHOW:
             # 在 UI 线程弹出「快捷键设置」弹层（嵌套消息循环），托盘回调立即返回。
             open_hotkey_settings(self.hwnd)
+            return 0
+        if msg == WM_LOG_VIEW_SHOW:
+            # 在 UI 线程弹出「运行日志」查看窗口（嵌套消息循环），托盘回调立即返回。
+            open_log_viewer(self.hwnd)
             return 0
         if msg == win32con.WM_COMMAND:
             ctrl_id = wparam & 0xFFFF
@@ -568,10 +772,26 @@ def ui_loop():
         return
     try:
         result_win.build()
+        # 启动 Esc 关闭/取消键的轻量钩子（裸键，RegisterHotKey 无法注册）
+        start_esc_listener()
+        # 在 UI 线程注册全局热键（依赖 result_win.hwnd），并检测启动冲突
+        try:
+            ok, failures = start_hotkey_listener()
+            if not ok:
+                global _pending_conflict_msg
+                lines = "\n".join(f"• {hk}（{name}）：{reason}"
+                                  for (hk, name, reason) in failures)
+                _pending_conflict_msg = ("部分快捷键被其它程序或系统占用，可能无法使用：\n\n"
+                                         + lines + "\n\n可右键托盘 → 快捷键设置 重新指定。")
+                win32gui.PostMessage(result_win.hwnd, WM_HOTKEY_CONFLICT_SHOW, 0, 0)
+        except Exception as e:
+            print(f"[UI] 热键注册失败: {e}")
         if _FIRST_RUN:
-            # 首次运行：自动弹出“关于”（走与托盘菜单相同的 UI 线程消息路径）
+            # 首次运行：在 UI 线程同步弹出“关于”。此时窗口已 build 完成、hwnd 有效，
+            # 直接调用（而非 PostMessage）最可靠——不依赖消息队列/消息泵时序，必弹。
             try:
-                win32gui.PostMessage(result_win.hwnd, WM_ABOUT_SHOW, 0, 0)
+                print("[UI] 首次运行：即将弹出“关于”窗口...")
+                _show_about_modal(result_win.hwnd)
                 _mark_first_run_done()
                 print("[UI] 首次运行：已弹出“关于”窗口。")
             except Exception as e:
@@ -1097,6 +1317,12 @@ def do_define_preset(slot):
         save_presets()
         print(f"[定义] 已将 {name} 保存到槽位 {slot}（{len(rects)} 个区域），"
               f"重启后仍保留（见 region_presets.json）。")
+        # 定义后即时让“触发”快捷键生效：跨线程安全地请 UI 线程重新注册热键。
+        try:
+            if result_win is not None and result_win.hwnd:
+                win32gui.PostMessage(result_win.hwnd, WM_HOTKEY_RELOAD, 0, 0)
+        except Exception as e:
+            print(f"[定义] 请求热键重载失败（不影响预设保存）: {e}")
     except Exception as e:
         print(f"[定义] 出错: {e}")
     finally:
@@ -1222,31 +1448,87 @@ def _app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def get_log_path():
+    """返回日志文件路径（与 setup_logging 写入的位置一致）。"""
+    return os.path.join(_app_dir(), "ocrclient.log")
+
+
 def setup_logging():
-    """无控制台（frozen）时把 stdout/stderr 重定向到日志文件，便于排障。"""
-    log_path = os.path.join(_app_dir(), "ocrclient.log")
+    """无控制台（frozen）时把 stdout/stderr 重定向到日志文件，便于排障。
+
+    优先用 win32file 以 FILE_SHARE_READ 打开：日志查看器可在程序运行期间并发读取
+    该文件而不被“独占锁”挡住（默认 open() 的共享模式为 0，会阻止其它句柄读取）。
+    不支持 win32file 时退回普通追加打开（此时查看器可能无法实时读取被占用的文件）。
+    """
+    log_path = get_log_path()
+
+    if not HAS_WIN32FILE:
+        try:
+            fh = open(log_path, "a", encoding="utf-8", buffering=1)
+        except Exception as e:
+            print(f"[日志] 无法写入日志文件 {log_path}: {e}")
+            return
+
+        class _Tee:
+            def write(self, s):
+                try:
+                    fh.write(s)
+                except Exception:
+                    pass
+                return len(s) if isinstance(s, str) else 1
+
+            def flush(self):
+                try:
+                    fh.flush()
+                except Exception:
+                    pass
+
+            def isatty(self):
+                return False
+
+        sys.stdout = _Tee()
+        sys.stderr = _Tee()
+        print(f"[日志] 输出已重定向到 {log_path}")
+        return
+
     try:
-        fh = open(log_path, "a", encoding="utf-8", buffering=1)
+        h = win32file.CreateFile(
+            log_path,
+            win32file.GENERIC_WRITE,
+            win32file.FILE_SHARE_READ,   # 允许日志查看器并发读取
+            None,
+            win32file.OPEN_ALWAYS,
+            win32con.FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        win32file.SetFilePointer(h, 0, win32file.FILE_END)  # 追加到末尾，不覆盖历史
     except Exception as e:
         print(f"[日志] 无法写入日志文件 {log_path}: {e}")
         return
 
-    class _Tee:
+    class _FileTee:
+        def __init__(self, handle):
+            self._h = handle
+
         def write(self, s):
+            data = s.encode("utf-8", "replace") if isinstance(s, str) else bytes(s)
             try:
-                fh.write(s)
+                win32file.WriteFile(self._h, data)
             except Exception:
                 pass
             return len(s) if isinstance(s, str) else 1
 
         def flush(self):
             try:
-                fh.flush()
+                win32file.FlushFileBuffers(self._h)
             except Exception:
                 pass
 
-    sys.stdout = _Tee()
-    sys.stderr = _Tee()
+        def isatty(self):
+            return False
+
+    sys.stdout = _FileTee(h)
+    sys.stderr = _FileTee(h)
     print(f"[日志] 输出已重定向到 {log_path}")
 
 
@@ -1266,6 +1548,27 @@ def build_tray_icon_image():
     return img
 
 
+def _show_about_modal(hwnd):
+    """在窗口所属线程中以本窗口为 owner 弹出原生模态“关于”框（线程安全）。
+
+    必须在本窗口消息循环所在线程调用（ui_loop 线程）；若在托盘线程直接调用，
+    会表现为“确定”点不动、关不掉。首启自动弹窗与生产托盘菜单的“关于”共用本函数。
+    """
+    if not HAS_WIN32 or not hwnd:
+        print(_about_text())
+        return
+    try:
+        _bring_to_front(hwnd)
+        win32gui.MessageBox(
+            hwnd, _about_text(), "关于 · 屏幕OCR",
+            win32con.MB_OK | win32con.MB_ICONINFORMATION
+            | win32con.MB_SETFOREGROUND | win32con.MB_TOPMOST,
+        )
+        print("[UI] 关于弹窗已关闭。")
+    except Exception as e:
+        print(f"[UI] 关于弹窗异常: {e}")
+
+
 def show_about():
     """托盘菜单“关于”：把弹窗转交 UI 线程执行（PostMessage），托盘回调立即返回。
 
@@ -1282,11 +1585,25 @@ def show_about():
     print(_about_text())
 
 
+def show_log_viewer():
+    """托盘菜单“运行日志”：把查看窗口转交 UI 线程执行（PostMessage），托盘回调立即返回。
+
+    与 show_about 同理，绝不在托盘线程直接创建/操作 Win32 窗口。
+    """
+    if not HAS_WIN32:
+        print("[日志] 运行日志路径：%s" % get_log_path())
+        return
+    if result_win is not None and result_win.ready and result_win.hwnd:
+        win32gui.PostMessage(result_win.hwnd, WM_LOG_VIEW_SHOW, 0, 0)
+        return
+    print("[日志] 结果窗口尚未就绪，无法打开日志查看器；日志文件位于：%s" % get_log_path())
+
+
 def on_tray_exit(icon, item):
     """托盘"退出"：停止热键监听与托盘图标，干净退出。"""
     try:
-        if _hotkey_listener is not None:
-            _hotkey_listener.stop()
+        stop_hotkey_listener()
+        stop_esc_listener()
     except Exception:
         pass
     try:
@@ -1307,6 +1624,7 @@ def run_tray():
             "屏幕OCR（离线）",
             menu=pystray.Menu(
                 pystray.MenuItem("快捷键设置...", open_hotkey_settings_from_tray),
+                pystray.MenuItem("运行日志", show_log_viewer),
                 pystray.MenuItem("关于 / 快捷键", show_about),
                 pystray.MenuItem("退出", on_tray_exit),
             ),
@@ -1332,6 +1650,8 @@ def vk_to_pynput(vk):
     ctrl = (win32api.GetKeyState(win32con.VK_CONTROL) & 0x8000) != 0
     alt = (win32api.GetKeyState(win32con.VK_MENU) & 0x8000) != 0
     shift = (win32api.GetKeyState(win32con.VK_SHIFT) & 0x8000) != 0
+    win = ((win32api.GetKeyState(win32con.VK_LWIN) & 0x8000) != 0
+           or (win32api.GetKeyState(win32con.VK_RWIN) & 0x8000) != 0)
     parts = []
     if ctrl:
         parts.append("<ctrl>")
@@ -1339,6 +1659,8 @@ def vk_to_pynput(vk):
         parts.append("<alt>")
     if shift:
         parts.append("<shift>")
+    if win:
+        parts.append("<cmd>")
     main = None
     if 0x30 <= vk <= 0x39:
         main = chr(vk)                # 0-9
@@ -1653,14 +1975,17 @@ class HotkeySettingsDialog:
         # 应用并即时生效
         old = dict(CFG)
         apply_config(self.values)
-        ok, err = start_hotkey_listener()
+        ok, failures = start_hotkey_listener()
         if not ok:
-            # 注册失败（可能被系统/其它软件占用），回退到原设置
+            # 注册失败（被其它程序/系统占用）→ 回退到原设置并明确提示冲突
             apply_config(old)
+            start_hotkey_listener()   # 恢复旧热键
+            lines = "\n".join(f"• {hk}（{name}）：{reason}"
+                              for (hk, name, reason) in failures)
             win32gui.MessageBox(
                 self.hwnd,
-                f"新快捷键注册失败，已恢复原有设置。\n原因：{err}",
-                "注册失败",
+                "以下快捷键与其他程序/系统冲突，已恢复原有设置：\n\n" + lines,
+                "快捷键冲突",
                 win32con.MB_OK | win32con.MB_ICONERROR | win32con.MB_TOPMOST,
             )
             return
@@ -1690,6 +2015,202 @@ class HotkeySettingsDialog:
         try:
             if self._atom is not None and self._inst is not None:
                 win32gui.UnregisterClass("OCRHotkeySettingsDlg", self._inst)
+        except Exception:
+            pass
+
+
+# ----------------- 运行日志查看窗口（系统托盘 → 原生对话框） -----------------
+def read_log_content(path, max_chars=200000):
+    """读取日志文件内容；过大时只返回末尾 max_chars 并提示。"""
+    if not os.path.exists(path):
+        return "(日志文件尚不存在，程序运行一会儿后这里会记录输出。)"
+    try:
+        size = os.path.getsize(path)
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            if size > max_chars:
+                f.seek(max(0, size - max_chars))
+                data = f.read()
+                # 跳过被截断的半行，从下一个完整行开始
+                if data and not data.startswith("\n"):
+                    nl = data.find("\n")
+                    if nl != -1:
+                        data = data[nl + 1:]
+                return ("（仅显示最近约 %dKB，完整日志请点“打开日志文件”）\n\n"
+                        % (max_chars // 1000)) + data
+            return f.read()
+    except Exception as e:
+        return f"（读取日志失败：{e}）"
+
+
+_log_viewer_open = False
+
+
+def open_log_viewer(owner_hwnd):
+    """在 UI 线程弹出「运行日志」查看窗口（嵌套消息循环）。"""
+    global _log_viewer_open
+    if _log_viewer_open:
+        return  # 防止重复打开
+    if not HAS_WIN32:
+        print("[日志] 需要 pywin32（Windows）才能打开日志窗口。")
+        return
+    _log_viewer_open = True
+    try:
+        dlg = LogViewerDialog(owner_hwnd)
+        dlg.run()
+    except Exception as e:
+        print(f"[日志] 打开失败: {e}")
+    finally:
+        _log_viewer_open = False
+
+
+class LogViewerDialog:
+    """系统托盘「运行日志」查看窗口：只读展示 ocrclient.log 的实时内容。
+
+    提供「刷新」重新读取文件、「复制全部」复制到剪贴板、「打开日志文件」用系统
+    默认程序打开日志，「关闭」退出。窗口由 UI 线程以嵌套消息循环驱动，避免阻塞
+    托盘回调。日志文件已被 setup_logging 以 FILE_SHARE_READ 打开，可并发读取。
+    """
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.hwnd = None
+        self.edit = None
+        self._inst = None
+        self._atom = None
+        self.log_path = get_log_path()
+
+    def _load(self):
+        content = read_log_content(self.log_path)
+        try:
+            win32gui.SendMessage(self.edit, win32con.WM_SETTEXT, 0, content)
+            # 滚动到底部
+            win32gui.SendMessage(self.edit, win32con.WM_VSCROLL,
+                                 win32con.SB_BOTTOM, 0)
+        except Exception:
+            pass
+
+    def _copy(self):
+        try:
+            text = win32gui.GetWindowText(self.edit)
+            if text:
+                pyperclip.copy(text)
+                show_toast("日志已复制到剪贴板")
+        except Exception as e:
+            print(f"[日志] 复制失败: {e}")
+
+    def _open_file(self):
+        try:
+            os.startfile(self.log_path)
+        except Exception as e:
+            print(f"[日志] 打开文件失败: {e}")
+
+    def build(self):
+        self._inst = win32api.GetModuleHandle(None)
+        wc = win32gui.WNDCLASS()
+        wc.hInstance = self._inst
+        wc.lpszClassName = "OCRLogViewerDlg"
+        wc.lpfnWndProc = self._wndproc
+        wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
+        wc.hbrBackground = win32con.COLOR_BTNFACE + 1
+        self._atom = win32gui.RegisterClass(wc)
+
+        w, h = 640, 480
+        cx = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+        x = max(0, (cx - w) // 2)
+        y = 90
+        style = (win32con.WS_POPUP | win32con.WS_CAPTION | win32con.WS_SYSMENU
+                 | win32con.WS_THICKFRAME | win32con.WS_VSCROLL)
+        self.hwnd = win32gui.CreateWindow(
+            self._atom, "运行日志 - ocrclient.log", style,
+            x, y, w, h, self.owner or 0, 0, self._inst, None,
+        )
+        self.edit = win32gui.CreateWindow(
+            "EDIT", "",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.WS_BORDER
+            | win32con.WS_VSCROLL | win32con.WS_HSCROLL
+            | win32con.ES_MULTILINE | win32con.ES_AUTOVSCROLL
+            | win32con.ES_AUTOHSCROLL | win32con.ES_READONLY,
+            12, 12, w - 24, h - 70, self.hwnd, 1, self._inst, None,
+        )
+        try:
+            lf = win32gui.LOGFONT()
+            lf.lfHeight = -15
+            lf.lfFaceName = "Microsoft YaHei"
+            hf = win32gui.CreateFontIndirect(lf)
+            win32gui.SendMessage(self.edit, win32con.WM_SETFONT, hf, 1)
+        except Exception:
+            pass
+
+        # 底部按钮区
+        btn_w, btn_h, gap = 150, 32, 12
+        total = btn_w * 3 + gap * 2
+        bx = max(12, (w - total) // 2)
+        by = h - 48
+        win32gui.CreateWindow(
+            "BUTTON", "刷新",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
+            bx, by, btn_w, btn_h, self.hwnd, 2, self._inst, None,
+        )
+        win32gui.CreateWindow(
+            "BUTTON", "复制全部",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
+            bx + btn_w + gap, by, btn_w, btn_h, self.hwnd, 3, self._inst, None,
+        )
+        win32gui.CreateWindow(
+            "BUTTON", "打开日志文件",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
+            bx + (btn_w + gap) * 2, by, btn_w, btn_h,
+            self.hwnd, 4, self._inst, None,
+        )
+        # 右上角关闭按钮（标题栏也有关闭，这里再给一个显式入口）
+        win32gui.CreateWindow(
+            "BUTTON", "关闭",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
+            w - 92, 10, 80, 28, self.hwnd, 5, self._inst, None,
+        )
+        self._load()
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == win32con.WM_COMMAND:
+            cid = wparam & 0xFFFF
+            if cid == 2:
+                self._load()
+            elif cid == 3:
+                self._copy()
+            elif cid == 4:
+                self._open_file()
+            elif cid == 5:
+                self._close()
+            return 0
+        if msg == win32con.WM_CLOSE:
+            self._close()
+            return 0
+        if msg == win32con.WM_DESTROY:
+            return 0
+        return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+    def _close(self):
+        try:
+            if self.hwnd:
+                win32gui.DestroyWindow(self.hwnd)
+        except Exception:
+            pass
+        try:
+            win32gui.PostQuitMessage(0)
+        except Exception:
+            pass
+
+    def run(self):
+        self.build()
+        win32gui.ShowWindow(self.hwnd, win32con.SW_SHOW)
+        try:
+            _bring_to_front(self.hwnd)
+        except Exception:
+            pass
+        win32gui.PumpMessages()  # 嵌套消息循环，直到 DestroyWindow + PostQuitMessage
+        try:
+            if self._atom is not None and self._inst is not None:
+                win32gui.UnregisterClass("OCRLogViewerDlg", self._inst)
         except Exception:
             pass
 
@@ -1728,7 +2249,7 @@ def main():
           f" → 触发 {TRIGGER_HOTKEY_PRETTY_TMPL % 1}~{TRIGGER_HOTKEY_PRETTY_TMPL % PRESET_SLOTS}")
     print(f"  已存选区   : {len(presets)} 个（见 region_presets.json）")
     print("  全屏模式：按快捷键识别整屏；区域模式：拖拽框选多区域后右键确认。")
-    print("  选区预设：Ctrl+Shift+N 框选存为选区N；之后 Ctrl+Alt+N 一键识别并静默复制。")
+    print("  选区预设：Ctrl+Shift+N 框选存为选区N；之后 Alt+Shift+N 一键识别并静默复制。")
     print("  按 Esc 关闭/取消当前弹窗（结果窗口或选区）；退出程序请右键托盘图标。")
     print("=" * 46)
 
@@ -1737,8 +2258,8 @@ def main():
     if tray_mode and HAS_TRAY:
         threading.Thread(target=run_tray, daemon=True).start()
 
-    # 启动全局热键监听（独立线程，支持运行时重载）
-    start_hotkey_listener()
+    # 全局热键监听已随 UI 线程（result_win）在 ui_loop() 中注册并由其消息泵驱动；
+    # 托盘“退出”会停止热键并退出进程。
     # 主线程保持运行，等待托盘退出（Ctrl+C 亦可直接结束）
     try:
         while True:

@@ -31,6 +31,8 @@ a = Analysis(
         "win32gui",
         "win32con",
         "win32api",
+        "win32file",
+        "pywintypes",
         "PIL",
         "PIL._imaging",
         "PIL._imagingtk",
