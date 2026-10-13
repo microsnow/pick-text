@@ -11,12 +11,15 @@ venv/
 .venv/
 
 # PyInstaller 构建产物（单文件夹打包输出，体积大、可重构建）
-build/
-build_new/
-build_stage/
-dist/
-dist_new/
-dist_stage/
+# 用通配覆盖所有变体（build*/dist*，含 _new/_stage/_old_<timestamp> 等）
+build*/
+dist*/
+
+# 日志文件（构建日志 build*.log + 运行时 ocrclient.log）
+*.log
+
+# 运行时本地配置（用户自定义快捷键 hotkeys.json，不同机器不一样）
+hotkeys.json
 
 # 运行时本地数据（用户选区预设，不同机器不一样）
 region_presets.json

@@ -8,16 +8,18 @@
 1) 全屏识别（默认快捷键 Win+Alt+O）
    - 抓取整个屏幕，识别其中全部文字，自动复制到剪贴板。
    - 弹出原生结果窗口：可鼠标框选部分文字后 Ctrl+C 进行“选择复制”；
-     也可点“复制全部”按钮复制整段。
+     也可点“复制全部”按钮复制整段（复制的是当前编辑框内容，含手动修改）。
+   - 结果框可直接编辑，并支持一键“导出 TXT / 导出 MD”（原生“另存为”对话框，
+     默认存到程序目录下的 exports/）。
 
-2) 区域选择识别（默认快捷键 Win+Alt+R）★新增
+2) 区域选择识别（默认快捷键 Win+Alt+Q）★新增
    - 屏幕变暗，鼠标左键拖拽即可框选一个区域；可多次拖拽框选多个区域。
 - 右键 / Enter 确认：仅识别各区域中的内容，多个区域之间用换行隔开。
-- 再次按 Win+Alt+R 重选/取消本次选择；ESC 取消选区（不退出程序）。
+- 再次按 Win+Alt+Q 重选/取消本次选择；ESC 取消选区（不退出程序）。
 
-3) 选区预设（快捷键 Win+Shift+1~9 定义 / Win+Alt+1~9 触发）★新增
-   - 用 Win+Shift+N 框选并把屏幕某块区域“存”为命名选区（落盘到 region_presets.json）。
-   - 之后按 Win+Alt+N 一键自动截该区域 → OCR → 静默复制到剪贴板，无需每次重画。
+3) 选区预设（快捷键 Ctrl+Shift+1~9 定义 / Alt+Shift+1~9 触发）★新增
+   - 用 Ctrl+Shift+N 框选并把屏幕某块区域“存”为命名选区（落盘到 region_presets.json）。
+   - 之后按 Alt+Shift+N 一键自动截该区域 → OCR → 静默复制到剪贴板，无需每次重画。
    - 适合反复取同一处固定文字（字幕条、计时器、比分牌、表单框等）。
 
 依赖：mss / rapidocr-onnxruntime / pynput / pyperclip / numpy / pywin32
@@ -25,6 +27,8 @@
 运行（在隔离 venv 中）：
     python main.py
 """
+
+__version__ = "2.0.0"
 
 import os
 import sys
@@ -76,6 +80,8 @@ AUTO_COPY_ALL = True        # OCR 后自动复制全部到剪贴板（一键复�
 SHOW_WINDOW = True          # 是否弹出结果窗口（支持框选复制）
 REGION_ALPHA = 160          # 区域选择遮罩的暗化不透明度（0-255，越大越暗）
 CLOSE_KEY = "<esc>"          # 关闭/取消“当前弹窗”（结果窗口或区域遮罩），绝不退出程序
+MONITOR_HOTKEY = "<ctrl>+<alt>+m"  # 锁定区域轮询监控：Ctrl+Alt+M（再次按下停止监控）
+MONITOR_INTERVAL = 1.0            # 监控轮询间隔（秒）；画面未变化时跳过 OCR 以省 CPU
 
 # ----------------- 选区预设（数字槽位） -----------------
 # 把屏幕上某块区域“存”成预设，绑定快捷键；之后一键自动截该区域→OCR→静默复制。
@@ -101,6 +107,7 @@ REGION_HOTKEY_PRETTY = _pretty(REGION_HOTKEY)
 CLOSE_KEY_PRETTY = _pretty(CLOSE_KEY)
 TRIGGER_HOTKEY_PRETTY_TMPL = "Alt+Shift+%d"
 DEFINE_HOTKEY_PRETTY_TMPL = "Ctrl+Shift+%d"
+MONITOR_HOTKEY_PRETTY = _pretty(MONITOR_HOTKEY)
 
 # =================================================
 
@@ -182,6 +189,7 @@ def build_hotkey_map():
     m = {
         HOTKEY: on_activate_ocr,
         REGION_HOTKEY: on_activate_region,
+        MONITOR_HOTKEY: on_activate_monitor,
     }
     # 关闭键：含修饰键才能注册；裸键（Esc 等）由 Esc 钩子负责
     try:
@@ -280,6 +288,7 @@ def _hk_name_map():
     """返回 {hk_str: 动作名} 便于冲突提示。"""
     items = [("全屏识别", CFG["full"]),
              ("区域选择", CFG["region"]),
+             ("区域监控", MONITOR_HOTKEY),
              ("关闭/取消", CFG["close"])]
     for n in range(1, PRESET_SLOTS + 1):
         items.append((f"选区定义{n}", CFG["define_tmpl"] % n))
@@ -492,17 +501,20 @@ WM_ABOUT_SHOW = win32con.WM_APP + 4    # 由窗口所属线程弹出“关于”
 WM_HOTKEY_RELOAD = win32con.WM_APP + 6  # 请求 UI 线程重新注册全局热键（跨线程安全）
 WM_HOTKEY_CONFLICT_SHOW = win32con.WM_APP + 7  # 启动后弹“热键冲突”提示
 WM_LOG_VIEW_SHOW = win32con.WM_APP + 8  # 由 UI 线程弹出“运行日志”查看窗口
+WM_MONITOR_UPDATE = win32con.WM_APP + 9  # 监控线程 -> UI 线程：刷新结果文本（线程安全）
+WM_MONITOR_START = win32con.WM_APP + 10  # 托盘菜单 -> UI 线程：弹出框选并启动监控
 
 
 def _about_text():
     """「关于」弹窗内容（托盘菜单与 UI 线程共用）。"""
     return (
-        "屏幕 OCR 客户端（离线）\n\n"
+        f"屏幕 OCR 客户端（离线） v{__version__}\n\n"
         f"全屏识别 : {HOTKEY_PRETTY}\n"
         f"区域选择 : {REGION_HOTKEY_PRETTY}\n\n"
         "选区预设 : 定义 Ctrl+Shift+1~9 → 触发 Alt+Shift+1~9\n\n"
         "关闭弹窗 : 按 Esc（或点结果窗口的“关闭”/X；选区中按 Esc 取消选区）\n"
-        "退出程序 : 右键托盘图标 → 退出（仅此一种方式）"
+        "退出程序 : 右键托盘图标 → 退出（仅此一种方式）\n\n"
+        f"区域监控 : {MONITOR_HOTKEY_PRETTY}（框选区域后可锁定轮询，字幕/歌词自动刷新；再次按下或 Esc 停止）"
     )
 
 
@@ -574,6 +586,13 @@ def _mark_first_run_done():
         pass
 
 
+def _text_to_markdown(text):
+    """把 OCR 逐行文本转为 Markdown：每行作为一个段落，空行自动跳过。"""
+    lines = [ln.rstrip() for ln in text.split("\n")]
+    paras = [ln for ln in lines if ln.strip()]
+    return "\n\n".join(paras)
+
+
 class ResultWindow:
     def __init__(self):
         self.hwnd = None
@@ -600,7 +619,7 @@ class ResultWindow:
         y = 40
         self.hwnd = win32gui.CreateWindow(
             self._atom,
-            "OCR 结果 - 框选后 Ctrl+C 复制 / 点'复制全部'",
+            "OCR 结果 - 框选后 Ctrl+C 复制 / 点'复制全部' / 可导出 TXT·MD",
             win32con.WS_OVERLAPPEDWINDOW & ~win32con.WS_THICKFRAME & ~win32con.WS_MAXIMIZEBOX,
             x, y, 580, 400,
             0, 0, self._inst, None,
@@ -624,12 +643,22 @@ class ResultWindow:
         win32gui.CreateWindow(
             "BUTTON", "复制全部",
             win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
-            10, 340, 160, 34, self.hwnd, 2, self._inst, None,
+            10, 340, 120, 34, self.hwnd, 2, self._inst, None,
+        )
+        win32gui.CreateWindow(
+            "BUTTON", "导出TXT",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
+            140, 340, 120, 34, self.hwnd, 4, self._inst, None,
+        )
+        win32gui.CreateWindow(
+            "BUTTON", "导出MD",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
+            270, 340, 120, 34, self.hwnd, 5, self._inst, None,
         )
         win32gui.CreateWindow(
             "BUTTON", "关闭",
             win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
-            180, 340, 160, 34, self.hwnd, 3, self._inst, None,
+            400, 340, 160, 34, self.hwnd, 3, self._inst, None,
         )
         win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
         self.ready = True
@@ -697,12 +726,28 @@ class ResultWindow:
             # 在 UI 线程弹出「运行日志」查看窗口（嵌套消息循环），托盘回调立即返回。
             open_log_viewer(self.hwnd)
             return 0
+        if msg == WM_MONITOR_UPDATE:
+            # 监控线程请求刷新结果文本（运行在 UI 线程，SendMessage 到同线程 edit 安全）
+            self.update_text()
+            return 0
+        if msg == WM_MONITOR_START:
+            # 托盘菜单“开始监控区域”请求：在 UI 线程弹框选并启动（与其他弹层一致）
+            try:
+                on_activate_monitor()
+            except Exception as e:
+                print(f"[监控] 启动异常: {e}")
+            return 0
         if msg == win32con.WM_COMMAND:
             ctrl_id = wparam & 0xFFFF
-            if ctrl_id == 2:          # “复制全部”按钮
-                if self.full_text:
-                    pyperclip.copy(self.full_text)
+            if ctrl_id == 2:          # “复制全部”按钮（复制当前编辑框内容，含用户修改）
+                cur = win32gui.GetWindowText(self.edit) if (HAS_WIN32 and self.edit) else self.full_text
+                if cur:
+                    pyperclip.copy(cur)
                     print("[OCR] 已复制全部到剪贴板。")
+            elif ctrl_id == 4:        # “导出 TXT”
+                self.export_result("txt")
+            elif ctrl_id == 5:        # “导出 MD”
+                self.export_result("md")
             elif ctrl_id == 3:        # “关闭”按钮
                 self._do_hide()
             return 0
@@ -760,6 +805,74 @@ class ResultWindow:
                 win32gui.PostMessage(self.hwnd, WM_RESULT_HIDE, 0, 0)
             except Exception:
                 pass
+
+    def update_text(self):
+        """监控模式：把 full_text 推到编辑框（由 UI 线程在 WM_MONITOR_UPDATE 中调用）。
+
+        若窗口被隐藏则显示（不抢焦点、不强制置顶，避免打断用户其它操作）；
+        已显示则只更新文本。配合 set_readonly(True) 实现“监控态只读”。
+        """
+        if not (HAS_WIN32 and self.edit):
+            return
+        try:
+            win32gui.SendMessage(self.edit, win32con.WM_SETTEXT, 0, self.full_text)
+            if not win32gui.IsWindowVisible(self.hwnd):
+                win32gui.ShowWindow(self.hwnd, win32con.SW_SHOW)
+                win32gui.SetWindowPos(
+                    self.hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE,
+                )
+        except Exception as e:
+            print(f"[UI] 监控刷新异常: {e}")
+
+    def set_readonly(self, flag):
+        """切换编辑框只读（监控态下置为只读，避免被下一轮结果覆盖用户编辑）。"""
+        if HAS_WIN32 and self.edit:
+            try:
+                win32gui.SendMessage(self.edit, win32con.EM_SETREADONLY,
+                                     1 if flag else 0, 0)
+            except Exception:
+                pass
+
+    def export_result(self, fmt):
+        """把当前编辑框内容导出为 .txt 或 .md（原生“另存为”对话框）。"""
+        if not (HAS_WIN32 and self.edit):
+            return
+        text = win32gui.GetWindowText(self.edit)
+        if not text.strip():
+            print("[OCR] 结果为空，未导出。")
+            return
+        export_dir = os.path.join(_app_dir(), "exports")
+        try:
+            os.makedirs(export_dir, exist_ok=True)
+        except Exception:
+            pass
+        defext = ".md" if fmt == "md" else ".txt"
+        filt = ("Markdown Files\0*.md\0All Files\0*.*\0" if fmt == "md"
+                else "Text Files\0*.txt\0All Files\0*.*\0")
+        try:
+            res = win32gui.GetSaveFileName(
+                InitialDir=export_dir, File="", DefExt=defext,
+                Title="导出 OCR 结果", Filter=filt,
+            )
+        except Exception as e:
+            print(f"[OCR] 导出对话框出错: {e}")
+            return
+        if not res:
+            return
+        path = res[0] if isinstance(res, (tuple, list)) else res
+        if not path:
+            return
+        if not path.lower().endswith(defext):
+            path += defext
+        try:
+            content = text if fmt == "txt" else _text_to_markdown(text)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            print(f"[OCR] 已导出到 {path}")
+            show_toast(f"已导出: {os.path.basename(path)}")
+        except Exception as e:
+            print(f"[OCR] 导出失败: {e}")
 
 
 result_win = ResultWindow()
@@ -1383,6 +1496,163 @@ def trigger_preset(slot):
         _lock.release()
 
 
+# ===================== 锁定区域轮询抓取（监控模式） =====================
+# monitor_state 保存后台轮询线程的运行状态与锁定区域；running 为唯一开关。
+monitor_state = {
+    "running": False,
+    "rects": [],
+    "monitor": 1,
+    "interval": MONITOR_INTERVAL,
+    "_last_hash": None,
+    "_thread": None,
+}
+
+
+def _image_hash(img):
+    """对 BGR 图像计算低成本感知哈希（用于判断监控区域是否变化，省去无谓 OCR）。
+
+    纯 numpy 实现，不依赖 opencv：降采样到 32x32 灰度后按均值二值化为整数位串。
+    """
+    h, w = img.shape[:2]
+    step = max(1, min(h, w) // 32)
+    small = img[::step, ::step]
+    if small.ndim == 3:
+        gray = small.mean(axis=2).astype(np.uint8)
+    else:
+        gray = small.astype(np.uint8) if small.dtype != np.uint8 else small
+    mean = gray.mean()
+    bits = (gray > mean)
+    hv = 0
+    for b in bits.flatten():
+        hv = (hv << 1) | (1 if b else 0)
+    return hv
+
+
+def ocr_rects(rects, mon_index):
+    """抓取指定显示器并对 rects（显示器相对坐标）做 OCR，返回合并文本。
+
+    供「触发选区」与「监控模式」共用，保证两者识别逻辑一致。
+    """
+    try:
+        mon = get_monitor(mon_index)
+        img = grab_monitor(mon)
+    except Exception as e:
+        print(f"[OCR] 抓取显示器失败: {e}")
+        return ""
+    ih, iw = img.shape[:2]
+    parts = []
+    for (x, y, w, h) in rects:
+        x0 = max(0, int(x)); y0 = max(0, int(y))
+        x1 = min(iw, int(x) + int(w)); y1 = min(ih, int(y) + int(h))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        crop = img[y0:y1, x0:x1]
+        if crop.size == 0:
+            continue
+        t = ocr_image(crop)
+        if t.strip():
+            parts.append(t)
+    return "\n".join(parts)
+
+
+def _region_bbox(rects, iw, ih):
+    """返回 rects 合并后的 (x0, y0, x1, y1)，越界已裁剪；无有效区域返回 None。"""
+    if not rects:
+        return None
+    xs0 = [max(0, int(x)) for (x, y, w, h) in rects]
+    ys0 = [max(0, int(y)) for (x, y, w, h) in rects]
+    xs1 = [min(iw, int(x) + int(w)) for (x, y, w, h) in rects]
+    ys1 = [min(ih, int(y) + int(h)) for (x, y, w, h) in rects]
+    bx0, by0 = min(xs0), min(ys0)
+    bx1, by1 = max(xs1), max(ys1)
+    if bx1 <= bx0 or by1 <= by0:
+        return None
+    return bx0, by0, bx1, by1
+
+
+def monitor_loop(rects, mon_index, interval):
+    """后台轮询线程：定时抓取锁定区域，画面变化时刷新结果窗口。"""
+    st = monitor_state
+    while st["running"]:
+        try:
+            mon = get_monitor(mon_index)
+            img = grab_monitor(mon)
+            ih, iw = img.shape[:2]
+            changed = True
+            bbox = _region_bbox(rects, iw, ih)
+            if bbox is not None:
+                bx0, by0, bx1, by1 = bbox
+                hv = _image_hash(img[by0:by1, bx0:bx1])
+                if hv == st["_last_hash"]:
+                    changed = False
+                else:
+                    st["_last_hash"] = hv
+            if changed:
+                text = ocr_rects(rects, mon_index)
+                if text.strip():
+                    if result_win is not None and result_win.hwnd:
+                        result_win.full_text = _crlf(text)
+                        win32gui.PostMessage(result_win.hwnd, WM_MONITOR_UPDATE, 0, 0)
+                    else:
+                        print("---- 监控结果 ----")
+                        print(text)
+                        print("------------------")
+                else:
+                    # 区域无文字（如黑屏/空白）：清空，避免残留旧结果
+                    if result_win is not None and result_win.hwnd:
+                        result_win.full_text = ""
+                        win32gui.PostMessage(result_win.hwnd, WM_MONITOR_UPDATE, 0, 0)
+        except Exception as e:
+            print(f"[监控] 出错: {e}")
+        # 等待下一轮（细粒度 sleep，便于 stop 后尽快退出）
+        t0 = time.time()
+        while st["running"] and (time.time() - t0) < interval:
+            time.sleep(0.1)
+    print("[监控] 线程已退出。")
+
+
+def start_monitor(rects, mon_index, interval=MONITOR_INTERVAL):
+    """启动锁定区域轮询。rects 为显示器相对坐标的矩形列表。"""
+    if monitor_state["running"]:
+        print("[监控] 已在运行中。")
+        return False
+    if not rects:
+        print("[监控] 未指定区域，已取消。")
+        return False
+    monitor_state["rects"] = [tuple(map(int, (x, y, w, h))) for (x, y, w, h) in rects]
+    monitor_state["monitor"] = mon_index
+    monitor_state["interval"] = max(0.3, float(interval))
+    monitor_state["_last_hash"] = None
+    monitor_state["running"] = True
+    t = threading.Thread(
+        target=monitor_loop,
+        args=(monitor_state["rects"], mon_index, monitor_state["interval"]),
+        daemon=True,
+    )
+    monitor_state["_thread"] = t
+    t.start()
+    # 监控态：结果窗口内容只读，避免被下一轮结果覆盖用户编辑
+    if result_win is not None:
+        result_win.set_readonly(True)
+    print(f"[监控] 已启动：锁定 {len(rects)} 个区域，每 "
+          f"{monitor_state['interval']:.1f}s 轮询（画面不变则跳过 OCR）。")
+    return True
+
+
+def stop_monitor():
+    """停止锁定区域轮询（保留结果窗口当前内容供查看/复制/导出）。"""
+    if not monitor_state["running"]:
+        return
+    monitor_state["running"] = False
+    if result_win is not None:
+        result_win.set_readonly(False)
+    print("[监控] 已停止。")
+
+
+def is_monitoring():
+    return monitor_state["running"]
+
+
 def on_activate_ocr():
     threading.Thread(target=do_ocr, daemon=True).start()
 
@@ -1408,6 +1678,11 @@ def on_activate_esc_close():
     走全局热键，不依赖弹窗是否拥有焦点，因此一定可用（区别于按钮的 WM_COMMAND）。
     """
     global region_sel
+    # 0) 监控中 → 停止监控并隐藏结果窗口（Esc 作为“停止监控/关弹窗”统一键）
+    if is_monitoring():
+        stop_monitor()
+        result_win.hide()
+        return
     # 1) 区域/定义选区进行中 → 取消选区（与“再次按快捷键取消”同一条取消消息）
     if region_sel is not None and getattr(region_sel, "hwnd", None):
         try:
@@ -1422,6 +1697,45 @@ def on_activate_esc_close():
 def on_activate_trigger(slot):
     """触发选区：一键自动截已存区域 → OCR → 静默复制。"""
     threading.Thread(target=trigger_preset, args=(slot,), daemon=True).start()
+
+
+def on_activate_monitor():
+    """锁定区域轮询监控：框选区域后持续 OCR 刷新结果窗口。再次按下 → 停止。
+
+    框选在 UI 线程进行（热键由 UI 线程派发，RegionSelector 用嵌套消息循环）。
+    """
+    global region_sel, _active_mode
+    if not HAS_WIN32:
+        print("[监控] 需要 pywin32（Windows）。已跳过。")
+        return
+    # 运行中再次触发 → 停止监控
+    if monitor_state["running"]:
+        stop_monitor()
+        show_toast("已停止区域监控")
+        return
+    if not _lock.acquire(blocking=False):
+        return  # 上一轮（区域/定义/框选）还在跑，忽略
+    try:
+        mon = get_monitor(MONITOR)
+        sel = RegionSelector()
+        sel.cancel_hint = MONITOR_HOTKEY_PRETTY
+        region_sel = sel
+        _active_mode = "monitor"
+        confirmed, rects = sel.select(mon)
+        region_sel = None
+        _active_mode = None
+        if not confirmed or not rects:
+            return
+        # 隐藏结果窗口，避免被截进屏幕
+        result_win.hide()
+        start_monitor(rects, MONITOR, MONITOR_INTERVAL)
+        show_toast("已开始区域监控")
+    except Exception as e:
+        print(f"[监控] 出错: {e}")
+    finally:
+        region_sel = None
+        _active_mode = None
+        _lock.release()
 
 
 def on_activate_define(slot):
@@ -1453,6 +1767,27 @@ def get_log_path():
     return os.path.join(_app_dir(), "ocrclient.log")
 
 
+def _rotate_log_if_needed(log_path, max_bytes=2 * 1024 * 1024, backups=3):
+    """启动时按大小轮转日志：ocrclient.log 超过 max_bytes 则 .1/.2/.3 整体后移，最旧丢弃。
+
+    注：轮转在每次启动 setup_logging 时进行（托盘常驻程序通常随系统/手动重启），
+    单次超长运行期内不轮转，足以避免日志无限增长。
+    """
+    try:
+        if not os.path.exists(log_path) or os.path.getsize(log_path) <= max_bytes:
+            return
+        oldest = f"{log_path}.{backups}"
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for i in range(backups - 1, 0, -1):
+            src = f"{log_path}.{i}"
+            if os.path.exists(src):
+                os.rename(src, f"{log_path}.{i + 1}")
+        os.rename(log_path, f"{log_path}.1")
+    except Exception as e:
+        print(f"[日志] 轮转失败（忽略）: {e}")
+
+
 def setup_logging():
     """无控制台（frozen）时把 stdout/stderr 重定向到日志文件，便于排障。
 
@@ -1461,6 +1796,7 @@ def setup_logging():
     不支持 win32file 时退回普通追加打开（此时查看器可能无法实时读取被占用的文件）。
     """
     log_path = get_log_path()
+    _rotate_log_if_needed(log_path)
 
     if not HAS_WIN32FILE:
         try:
@@ -1623,6 +1959,11 @@ def run_tray():
             build_tray_icon_image(),
             "屏幕OCR（离线）",
             menu=pystray.Menu(
+                pystray.MenuItem("开始监控区域...", start_monitor_from_tray,
+                                 visible=lambda item: not is_monitoring()),
+                pystray.MenuItem("停止监控", stop_monitor_from_tray,
+                                 visible=lambda item: is_monitoring()),
+                pystray.Menu.SEPARATOR,
                 pystray.MenuItem("快捷键设置...", open_hotkey_settings_from_tray),
                 pystray.MenuItem("运行日志", show_log_viewer),
                 pystray.MenuItem("关于 / 快捷键", show_about),
@@ -1632,6 +1973,18 @@ def run_tray():
         icon.run()
     except Exception as e:
         print(f"[托盘] 启动失败，退回无托盘模式: {e}")
+
+
+def start_monitor_from_tray(icon, item):
+    """托盘“开始监控区域”：在 UI 线程弹框选并启动（与其他弹层一致的请求方式）。"""
+    if HAS_WIN32 and result_win is not None and result_win.hwnd:
+        win32gui.PostMessage(result_win.hwnd, WM_MONITOR_START, 0, 0)
+
+
+def stop_monitor_from_tray(icon, item):
+    """托盘“停止监控”：停止后台轮询，保留结果窗口内容。"""
+    stop_monitor()
+    show_toast("已停止区域监控")
 
 
 # ----------------- 快捷键设置弹层（系统托盘 → 原生对话框） -----------------
@@ -2216,6 +2569,9 @@ class LogViewerDialog:
 
 
 def main():
+    if "--version" in sys.argv:
+        print(f"OCRClient {__version__}")
+        return
     # 桌面应用形态：打包后（frozen）默认启用系统托盘；可用 --tray 强制、--no-tray 禁用
     force_tray = "--tray" in sys.argv
     disable_tray = "--no-tray" in sys.argv
