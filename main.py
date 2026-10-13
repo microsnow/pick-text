@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-屏幕 OCR 客户端（全屏一键识别 + 区域多选识别，离线）
-=================================================
+拾字（PickText）· 屏幕离线 OCR 取字工具（全屏一键识别 + 区域多选识别，离线）
+====================================================================
 两种识别模式（均离线，OCR 引擎使用 RapidOCR / ONNX 推理）：
 
 1) 全屏识别（默认快捷键 Win+Alt+O）
@@ -126,6 +126,80 @@ DEFAULT_HOTKEYS = {
     "define_tmpl": DEFINE_HOTKEY_TMPL,
 }
 CFG = dict(DEFAULT_HOTKEYS)   # 当前生效的快捷键配置（运行时可改）
+
+
+# ----------------- OCR 后处理（layout.py：竖排重排 / 繁体 / 标点） -----------------
+# layout 为可选增强模块：导入失败时退化为“横排 + 原样”，不影响主流程。
+try:
+    from layout import (
+        reorder_vertical,
+        to_traditional,
+        add_punctuation,
+        _HAS_OPENCC as LAYOUT_HAS_OPENCC,
+    )
+except Exception as _layout_err:  # pragma: no cover - 环境相关
+    def reorder_vertical(items):  # 退化：当 layout 不可用时按横排处理
+        return _merge_horizontal(items)
+    def to_traditional(t):
+        return t
+    def add_punctuation(t):
+        return t
+    LAYOUT_HAS_OPENCC = False
+    print(f"[layout] 模块加载失败，竖排/繁体/标点功能不可用: {_layout_err}")
+
+
+# ----------------- OCR 选项（排版 / 输出 / 标点，落盘 ocr_settings.json） -----------------
+OCR_SETTINGS_FILE = os.path.join(_BASE_DIR, "ocr_settings.json")
+DEFAULT_OCR_SETTINGS = {
+    "vertical": False,      # 竖排重排（上→下、右→左）
+    "traditional": False,   # 简体→繁体（OpenCC s2t，离线）
+    "punctuate": "off",     # 自动标点：off / rule（离线规则）
+}
+OCR_CFG = dict(DEFAULT_OCR_SETTINGS)
+VERTICAL = False
+TRADITIONAL = False
+PUNCTUATE = "off"
+
+
+def load_ocr_config():
+    """从 ocr_settings.json 读取 OCR 选项；缺失/损坏则回退默认。"""
+    cfg = dict(DEFAULT_OCR_SETTINGS)
+    try:
+        if os.path.exists(OCR_SETTINGS_FILE):
+            with open(OCR_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k in DEFAULT_OCR_SETTINGS:
+                    if k in data:
+                        cfg[k] = data[k]
+    except Exception as e:
+        print(f"[OCR设置] 读取 {OCR_SETTINGS_FILE} 失败，使用默认: {e}")
+    cfg["vertical"] = bool(cfg.get("vertical"))
+    cfg["traditional"] = bool(cfg.get("traditional"))
+    if cfg.get("punctuate") not in ("off", "rule"):
+        cfg["punctuate"] = "off"
+    return cfg
+
+
+def save_ocr_config(cfg):
+    """把 OCR 选项写回 ocr_settings.json。"""
+    try:
+        os.makedirs(os.path.dirname(OCR_SETTINGS_FILE), exist_ok=True)
+        with open(OCR_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[OCR设置] 保存 {OCR_SETTINGS_FILE} 失败: {e}")
+
+
+def apply_ocr_config(cfg):
+    """把 OCR 选项写回全局变量，供 ocr_image 使用。"""
+    global OCR_CFG, VERTICAL, TRADITIONAL, PUNCTUATE
+    OCR_CFG = dict(cfg)
+    VERTICAL = bool(OCR_CFG.get("vertical"))
+    TRADITIONAL = bool(OCR_CFG.get("traditional"))
+    PUNCTUATE = OCR_CFG.get("punctuate", "off")
+    if TRADITIONAL and not LAYOUT_HAS_OPENCC:
+        print("[OCR设置] 已开启“转繁体”，但 opencc-python 未安装，繁体转换将无效（输出原样）。")
 
 
 def load_hotkey_config():
@@ -366,6 +440,8 @@ def stop_hotkey_listener():
 # 启动时加载已保存配置（覆盖默认）
 _loaded = load_hotkey_config()
 apply_config(_loaded)
+_ocr_loaded = load_ocr_config()
+apply_ocr_config(_ocr_loaded)
 
 
 def _crlf(s):
@@ -508,7 +584,7 @@ WM_MONITOR_START = win32con.WM_APP + 10  # 托盘菜单 -> UI 线程：弹出框
 def _about_text():
     """「关于」弹窗内容（托盘菜单与 UI 线程共用）。"""
     return (
-        f"屏幕 OCR 客户端（离线） v{__version__}\n\n"
+        f"拾字（PickText）· 屏幕离线取字工具 v{__version__}\n\n"
         f"全屏识别 : {HOTKEY_PRETTY}\n"
         f"区域选择 : {REGION_HOTKEY_PRETTY}\n\n"
         "选区预设 : 定义 Ctrl+Shift+1~9 → 触发 Alt+Shift+1~9\n\n"
@@ -721,6 +797,10 @@ class ResultWindow:
         if msg == WM_HOTKEY_SETTINGS_SHOW:
             # 在 UI 线程弹出「快捷键设置」弹层（嵌套消息循环），托盘回调立即返回。
             open_hotkey_settings(self.hwnd)
+            return 0
+        if msg == WM_OCR_SETTINGS_SHOW:
+            # 在 UI 线程弹出「OCR 选项」弹层（嵌套消息循环），托盘回调立即返回。
+            open_ocr_settings(self.hwnd)
             return 0
         if msg == WM_LOG_VIEW_SHOW:
             # 在 UI 线程弹出「运行日志」查看窗口（嵌套消息循环），托盘回调立即返回。
@@ -1255,32 +1335,11 @@ def show_toast(text, duration_ms=1600):
 
 
 # ----------------- 核心逻辑 -----------------
-def ocr_image(img):
-    """对单张 BGR 图像做 OCR，返回换行拼接的文本。
+def _merge_horizontal(items):
+    """把检测框按“同一行”归并（纵向重叠即同行的相邻片段），每行内按 x 从左到右拼接。
 
-    OCR 检测器有时会把**同一行**文本拆成多个框（如中英文混排处的断点），
-    若直接按框逐行输出，会导致一个区域识别出多行。这里先把纵向重叠的框
-    归并为“同一行”再拼接，从而保证“一行文字 → 一行输出”，同时不影响
-    区域内本来就存在的多行（不同行纵向不重叠，仍各自成行）。
+    用于横排场景；竖排由 layout.reorder_vertical 处理。items: [(x0,x1,y0,y1,text), ...]
     """
-    engine = get_engine()
-    result, _ = engine(img)
-    if not result:
-        return ""
-
-    # 收集每个检测框：x0, x1, y0, y1, text
-    items = []
-    for line in result:
-        box, text = line[0], line[1]
-        if not text or not text.strip():
-            continue
-        xs = [float(p[0]) for p in box]
-        ys = [float(p[1]) for p in box]
-        items.append((min(xs), max(xs), min(ys), max(ys), text))
-    if not items:
-        return ""
-
-    # 按纵向位置归并为“行”
     items.sort(key=lambda t: t[2])  # 按 y_top
     rows = []
     for it in items:
@@ -1299,8 +1358,6 @@ def ocr_image(img):
                 break
         if not placed:
             rows.append([it])
-
-    # 每行内按 x 从左到右拼接；行间按行首 y 从上到下输出
     rows.sort(key=lambda row: min(r[2] for r in row))
     lines = []
     for row in rows:
@@ -1314,6 +1371,44 @@ def ocr_image(img):
                 merged += sep + text
         lines.append(merged)
     return "\n".join(lines)
+
+
+def ocr_image(img):
+    """对单张 BGR 图像做 OCR，返回换行拼接的文本。
+
+    OCR 检测器有时会把**同一行**文本拆成多个框（如中英文混排处的断点），
+    若直接按框逐行输出，会导致一个区域识别出多行。这里先把纵向重叠的框
+    归并为“同一行”再拼接，从而保证“一行文字 → 一行输出”，同时不影响
+    区域内本来就存在的多行（不同行纵向不重叠，仍各自成行）。
+
+    随后按当前 OCR 选项串联后处理：
+      - 竖排模式：用 layout.reorder_vertical 按“上→下、右→左”重排；
+      - 繁体输出：用 OpenCC 简→繁转换；
+      - 自动标点：用 layout.add_punctuation 离线规则补句读。
+    """
+    engine = get_engine()
+    result, _ = engine(img)
+    if not result:
+        return ""
+
+    # 收集每个检测框：x0, x1, y0, y1, text
+    items = []
+    for line in result:
+        box, text = line[0], line[1]
+        if not text or not text.strip():
+            continue
+        xs = [float(p[0]) for p in box]
+        ys = [float(p[1]) for p in box]
+        items.append((min(xs), max(xs), min(ys), max(ys), text))
+    if not items:
+        return ""
+
+    text = reorder_vertical(items) if VERTICAL else _merge_horizontal(items)
+    if TRADITIONAL:
+        text = to_traditional(text)
+    if PUNCTUATE == "rule":
+        text = add_punctuation(text)
+    return text
 
 
 def do_ocr():
@@ -1614,7 +1709,7 @@ def monitor_loop(rects, mon_index, interval):
 def start_monitor(rects, mon_index, interval=MONITOR_INTERVAL):
     """启动锁定区域轮询。rects 为显示器相对坐标的矩形列表。"""
     if monitor_state["running"]:
-        print("[监控] 已在运行中。")
+        print("[监控] 拾字 已在运行中。")
         return False
     if not rects:
         print("[监控] 未指定区域，已取消。")
@@ -1869,17 +1964,40 @@ def setup_logging():
 
 
 def build_tray_icon_image():
-    """用 PIL 绘制一个简单蓝色图标（无需外部素材）。"""
+    """用 PIL 绘制「拾字」图标（渐变磁贴 + 白字「字」，无需外部素材）。
+
+    与 assets/icon.ico 同源设计，但按托盘小尺寸（约 16px 展示）做简化：
+    省去取景框、放大主字，保证缩小后仍清晰可辨。
+    """
     size = 64
+    top, bot = (37, 99, 235), (6, 182, 212)     # 品牌渐变：蓝 -> 青
+    base = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    px = base.load()
+    for y in range(size):
+        t = y / (size - 1)
+        r = int(top[0] + (bot[0] - top[0]) * t)
+        g = int(top[1] + (bot[1] - top[1]) * t)
+        b = int(top[2] + (bot[2] - top[2]) * t)
+        for x in range(size):
+            px[x, y] = (r, g, b, 255)
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, size - 1, size - 1],
+                                           radius=14, fill=255)
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    img.paste(base, (0, 0), mask)
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([4, 4, size - 4, size - 4], radius=14,
-                        fill=(0, 120, 215, 255))
-    try:
-        fnt = ImageFont.truetype("msyh.ttc", 34)
-    except Exception:
+    d.rounded_rectangle([1, 1, size - 2, size - 2], radius=13,
+                        outline=(255, 255, 255, 50), width=1)
+    fnt = None
+    for name in ("msyhbd.ttc", "msyh.ttc", "simhei.ttf"):
+        try:
+            fnt = ImageFont.truetype(name, int(size * 0.60))
+            break
+        except Exception:
+            continue
+    if fnt is None:
         fnt = ImageFont.load_default()
-    d.text((size // 2, size // 2), "Aa", font=fnt,
+    d.text((size // 2, size // 2), "字", font=fnt,
            fill=(255, 255, 255, 255), anchor="mm")
     return img
 
@@ -1896,7 +2014,7 @@ def _show_about_modal(hwnd):
     try:
         _bring_to_front(hwnd)
         win32gui.MessageBox(
-            hwnd, _about_text(), "关于 · 屏幕OCR",
+            hwnd, _about_text(), "关于 · 拾字 PickText",
             win32con.MB_OK | win32con.MB_ICONINFORMATION
             | win32con.MB_SETFOREGROUND | win32con.MB_TOPMOST,
         )
@@ -1957,7 +2075,7 @@ def run_tray():
         icon = pystray.Icon(
             "ScreenOCR",
             build_tray_icon_image(),
-            "屏幕OCR（离线）",
+            "拾字（离线）",
             menu=pystray.Menu(
                 pystray.MenuItem("开始监控区域...", start_monitor_from_tray,
                                  visible=lambda item: not is_monitoring()),
@@ -1965,6 +2083,7 @@ def run_tray():
                                  visible=lambda item: is_monitoring()),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("快捷键设置...", open_hotkey_settings_from_tray),
+                pystray.MenuItem("OCR 选项...", open_ocr_settings_from_tray),
                 pystray.MenuItem("运行日志", show_log_viewer),
                 pystray.MenuItem("关于 / 快捷键", show_about),
                 pystray.MenuItem("退出", on_tray_exit),
@@ -1991,8 +2110,10 @@ def stop_monitor_from_tray(icon, item):
 # 弹层由 UI 线程（result_win 所属线程）以嵌套消息循环弹出，避免阻塞托盘回调。
 if HAS_WIN32:
     WM_HOTKEY_SETTINGS_SHOW = win32con.WM_APP + 5  # 由 UI 线程弹出设置弹层
+    WM_OCR_SETTINGS_SHOW = win32con.WM_APP + 6     # 由 UI 线程弹出 OCR 选项弹层
 else:
     WM_HOTKEY_SETTINGS_SHOW = 0
+    WM_OCR_SETTINGS_SHOW = 0
 
 
 def vk_to_pynput(vk):
@@ -2372,6 +2493,178 @@ class HotkeySettingsDialog:
             pass
 
 
+# ----------------- OCR 选项弹层（系统托盘 → 原生对话框） -----------------
+_ocr_settings_open = False
+
+
+class OcrSettingsDialog:
+    """系统托盘「OCR 选项」弹层：排版（横/竖）、输出（简/繁）、自动标点（关/规则）。"""
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.hwnd = None
+        self.chk_vertical = None
+        self.chk_traditional = None
+        self.chk_punct = None
+        self._inst = None
+        self._atom = None
+        self.values = dict(OCR_CFG)
+
+    def build(self):
+        self._inst = win32api.GetModuleHandle(None)
+        wc = win32gui.WNDCLASS()
+        wc.hInstance = self._inst
+        wc.lpszClassName = "OCROptionsDlg"
+        wc.lpfnWndProc = self._wndproc
+        wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
+        wc.hbrBackground = win32con.COLOR_BTNFACE + 1
+        self._atom = win32gui.RegisterClass(wc)
+
+        w, h = 460, 340
+        cx = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+        x = max(0, (cx - w) // 2)
+        y = 150
+        style = win32con.WS_POPUP | win32con.WS_CAPTION | win32con.WS_SYSMENU
+        self.hwnd = win32gui.CreateWindow(
+            self._atom, "OCR 选项", style,
+            x, y, w, h, self.owner or 0, 0, self._inst, None,
+        )
+        win32gui.CreateWindow(
+            "STATIC",
+            "竖排：按“上→下、右→左”重排（古籍/字幕）\n"
+            "繁体：简体→繁体（OpenCC 离线）\n"
+            "标点：离线规则补句读（保守，供初稿）",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.SS_LEFT,
+            20, 14, w - 40, 64, self.hwnd, 10, self._inst, None,
+        )
+        self.chk_vertical = win32gui.CreateWindow(
+            "BUTTON", "竖排模式（上→下、右→左）",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_AUTOCHECKBOX,
+            24, 90, 400, 28, self.hwnd, 1, self._inst, None,
+        )
+        self.chk_traditional = win32gui.CreateWindow(
+            "BUTTON", "输出繁体（简→繁，OpenCC 离线）",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_AUTOCHECKBOX,
+            24, 124, 400, 28, self.hwnd, 2, self._inst, None,
+        )
+        self.chk_punct = win32gui.CreateWindow(
+            "BUTTON", "自动标点（离线规则，补句读）",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_AUTOCHECKBOX,
+            24, 158, 400, 28, self.hwnd, 3, self._inst, None,
+        )
+        win32gui.SendMessage(self.chk_vertical, win32con.BM_SETCHECK,
+                             1 if self.values.get("vertical") else 0, 0)
+        win32gui.SendMessage(self.chk_traditional, win32con.BM_SETCHECK,
+                             1 if self.values.get("traditional") else 0, 0)
+        win32gui.SendMessage(self.chk_punct, win32con.BM_SETCHECK,
+                             1 if self.values.get("punctuate") == "rule" else 0, 0)
+        try:
+            lf = win32gui.LOGFONT()
+            lf.lfHeight = -15
+            lf.lfFaceName = "Microsoft YaHei"
+            hf = win32gui.CreateFontIndirect(lf)
+            for hw in (self.chk_vertical, self.chk_traditional, self.chk_punct):
+                win32gui.SendMessage(hw, win32con.WM_SETFONT, hf, 1)
+        except Exception:
+            pass
+        win32gui.CreateWindow(
+            "BUTTON", "取消",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON,
+            w - 220, h - 48, 100, 32, self.hwnd, 902, self._inst, None,
+        )
+        win32gui.CreateWindow(
+            "BUTTON", "确定",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_PUSHBUTTON
+            | win32con.BS_DEFPUSHBUTTON,
+            w - 110, h - 48, 94, 32, self.hwnd, 901, self._inst, None,
+        )
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == win32con.WM_COMMAND:
+            cid = wparam & 0xFFFF
+            if cid == 901:
+                self._on_ok()
+                return 0
+            if cid == 902:
+                self._close()
+                return 0
+            return 0
+        if msg == win32con.WM_CLOSE:
+            self._close()
+            return 0
+        if msg == win32con.WM_DESTROY:
+            return 0
+        return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+    def _on_ok(self):
+        vertical = win32gui.SendMessage(
+            self.chk_vertical, win32con.BM_GETCHECK, 0, 0) == 1
+        traditional = win32gui.SendMessage(
+            self.chk_traditional, win32con.BM_GETCHECK, 0, 0) == 1
+        punct = win32gui.SendMessage(
+            self.chk_punct, win32con.BM_GETCHECK, 0, 0) == 1
+        cfg = {
+            "vertical": vertical,
+            "traditional": traditional,
+            "punctuate": "rule" if punct else "off",
+        }
+        apply_ocr_config(cfg)
+        save_ocr_config(cfg)
+        show_toast("OCR 选项已更新")
+        self._close()
+
+    def _close(self):
+        try:
+            if self.hwnd:
+                win32gui.DestroyWindow(self.hwnd)
+        except Exception:
+            pass
+        try:
+            win32gui.PostQuitMessage(0)
+        except Exception:
+            pass
+
+    def run(self):
+        self.build()
+        win32gui.ShowWindow(self.hwnd, win32con.SW_SHOW)
+        try:
+            _bring_to_front(self.hwnd)
+        except Exception:
+            pass
+        win32gui.PumpMessages()
+        try:
+            if self._atom is not None and self._inst is not None:
+                win32gui.UnregisterClass("OCROptionsDlg", self._inst)
+        except Exception:
+            pass
+
+
+def open_ocr_settings(owner_hwnd):
+    """在 UI 线程弹出「OCR 选项」弹层（嵌套消息循环）。"""
+    global _ocr_settings_open
+    if _ocr_settings_open:
+        return  # 防止重复打开
+    if not HAS_WIN32:
+        print("[OCR设置] 需要 pywin32（Windows）才能打开设置窗口。")
+        return
+    _ocr_settings_open = True
+    try:
+        dlg = OcrSettingsDialog(owner_hwnd)
+        dlg.run()
+    except Exception as e:
+        print(f"[OCR设置] 打开失败: {e}")
+    finally:
+        _ocr_settings_open = False
+
+
+def open_ocr_settings_from_tray(icon, item):
+    """托盘菜单回调：把打开请求转交 UI 线程（PostMessage），立即返回。"""
+    if result_win is not None and result_win.ready and result_win.hwnd:
+        win32gui.PostMessage(result_win.hwnd, WM_OCR_SETTINGS_SHOW, 0, 0)
+    else:
+        print("[OCR设置] 结果窗口尚未就绪，无法打开 OCR 选项。")
+
+
 # ----------------- 运行日志查看窗口（系统托盘 → 原生对话框） -----------------
 def read_log_content(path, max_chars=200000):
     """读取日志文件内容；过大时只返回末尾 max_chars 并提示。"""
@@ -2570,7 +2863,7 @@ class LogViewerDialog:
 
 def main():
     if "--version" in sys.argv:
-        print(f"OCRClient {__version__}")
+        print(f"PickText {__version__}")
         return
     # 桌面应用形态：打包后（frozen）默认启用系统托盘；可用 --tray 强制、--no-tray 禁用
     force_tray = "--tray" in sys.argv
@@ -2581,7 +2874,7 @@ def main():
         if _another_instance_running():
             try:
                 win32gui.MessageBox(
-                    0, "屏幕OCR 已在运行。", "提示",
+                    0, "拾字 已在运行。", "提示",
                     win32con.MB_OK | win32con.MB_ICONINFORMATION | win32con.MB_TOPMOST,
                 )
             except Exception:
@@ -2593,7 +2886,7 @@ def main():
     _FIRST_RUN = _is_first_run()  # 首次运行（按机器记录）则自动弹“关于”
 
     print("=" * 46)
-    print("  屏幕 OCR 客户端（全屏 + 区域多选 + 选区预设 · 离线）")
+    print("  拾字（PickText）· 屏幕离线取字工具（全屏 + 区域多选 + 选区预设 · 离线）")
     print("=" * 46)
     load_presets()
     print(f"  全屏识别   : {HOTKEY_PRETTY}")

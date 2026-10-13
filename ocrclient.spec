@@ -38,6 +38,7 @@ a = Analysis(
         "PIL._imagingtk",
         "numpy",
         "onnxruntime",
+        "opencc",
     ],
     hookspath=[],
     hooksconfig={},

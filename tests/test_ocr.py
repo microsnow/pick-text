@@ -11,6 +11,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main  # noqa: E402
+import layout  # noqa: E402
 
 
 def test_crlf_idempotent():
@@ -77,3 +78,68 @@ def test_monitor_state_default_off():
     main.monitor_state["running"] = True
     assert main.is_monitoring() is True
     main.monitor_state["running"] = False
+
+
+# ---------------- 功能2：竖排重排 / 繁体 / 标点 ----------------
+
+def test_reorder_vertical_rtl():
+    # 右列（x≈400）两框上下：甲(上) 乙(下)；左列（x≈100）一框：丙
+    items = [
+        (400, 440, 10, 30, "甲"),
+        (400, 440, 40, 60, "乙"),
+        (100, 140, 10, 30, "丙"),
+    ]
+    # 右→左读：先右列(上→下) 再左列 → "甲乙" / "丙"
+    assert layout.reorder_vertical(items) == "甲乙\n丙"
+
+
+def test_reorder_vertical_clusters_same_column():
+    # x 重叠的两框聚为一列（上下），并与右侧单列按“右→左”排序：右列先读
+    items = [
+        (100, 140, 10, 30, "上"),
+        (100, 140, 40, 60, "下"),
+        (300, 340, 10, 30, "右"),
+    ]
+    assert layout.reorder_vertical(items) == "右\n上下"
+
+
+def test_reorder_vertical_empty():
+    assert layout.reorder_vertical([]) == ""
+
+
+def test_merge_horizontal_basic():
+    # 横排：CJK 相邻不补空格，拉丁相邻补空格；不同行各自成行
+    items = [
+        (10, 100, 10, 30, "你好"),
+        (110, 200, 10, 30, "世界"),
+        (10, 100, 100, 120, "Hello"),
+        (110, 200, 100, 120, "World"),
+    ]
+    assert main._merge_horizontal(items) == "你好世界\nHello World"
+
+
+def test_add_punctuation_terminal():
+    # 短句无标点 → 补句号；已含终止标点则不重复补
+    assert layout.add_punctuation("孔子曰学而时习之") == "孔子曰学而时习之。"
+    assert layout.add_punctuation("学而时习之。") == "学而时习之。"
+
+
+def test_add_punctuation_long_line_comma():
+    # 长句无标点 → 中点补逗号 + 句末补句号
+    out = layout.add_punctuation("吾日三省吾身为人谋而不忠乎与朋友交而不信乎")
+    assert "，" in out and out.endswith("。")
+
+
+def test_add_punctuation_preserves_blanks():
+    # 空行保留结构（调试/古籍分段）
+    assert layout.add_punctuation("甲\n\n乙") == "甲。\n\n乙。"
+
+
+def test_to_traditional():
+    if layout._HAS_OPENCC:
+        assert layout.to_traditional("汉字") == "漢字"
+    else:
+        # 未安装 OpenCC 时退化为原样，但不报错
+        assert layout.to_traditional("汉字") == "汉字"
+    assert layout.to_traditional("") == ""
+
