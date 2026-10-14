@@ -532,6 +532,9 @@ def save_presets():
         print(f"[预设] 保存 {PRESET_FILE} 失败: {e}")
 
 
+_engine = None  # RapidOCR 引擎单例（懒加载，见 get_engine）
+
+
 def get_engine():
     """懒加载 RapidOCR 引擎（模型随包内置，离线）。"""
     global _engine
