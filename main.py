@@ -39,10 +39,22 @@ import ctypes
 from ctypes import wintypes
 
 import numpy as np
+import cv2
 import mss
 import pyperclip
 from pynput import keyboard
 from rapidocr_onnxruntime import RapidOCR
+
+# PyInstaller 兼容：rapidocr-onnxruntime 在运行时用 importlib.import_module("ch_ppocr_v3_det")
+# 等顶层名动态导入其内联子包；冻结成单文件夹后，顶层名解析不到正确子包，会落到残缺模块，
+# 表现为 `module 'ch_ppocr_v3_det' has no attribute 'TextDetector'`。这里在首次实例化前把子包
+# 按顶层名注册进 sys.modules，确保动态导入命中正确模块（打包需配合 collect_submodules）。
+try:
+    import importlib as _importlib
+    for _sub in ("ch_ppocr_v3_det", "ch_ppocr_v3_rec", "ch_ppocr_v2_cls"):
+        sys.modules[_sub] = _importlib.import_module("rapidocr_onnxruntime." + _sub)
+except Exception as _e:  # 普通运行环境本就可达，异常仅提示、不影响
+    print(f"[初始化] 预注册 rapidocr 子包失败（可忽略）: {_e}")
 
 try:
     import win32gui
@@ -154,11 +166,17 @@ DEFAULT_OCR_SETTINGS = {
     "vertical": False,      # 竖排重排（上→下、右→左）
     "traditional": False,   # 简体→繁体（OpenCC s2t，离线）
     "punctuate": "off",     # 自动标点：off / rule（离线规则）
+    "enhance": True,        # 弱对比/小字增强（拉伸 + 小图放大 + 降阈值 + 小框噪声过滤）
 }
 OCR_CFG = dict(DEFAULT_OCR_SETTINGS)
 VERTICAL = False
 TRADITIONAL = False
 PUNCTUATE = "off"
+ENHANCE = True
+
+# 识别置信度阈值：增强模式降阈值以召回弱小文字；常规模式用 RapidOCR 默认 0.5
+TEXT_SCORE_NORMAL = 0.5
+TEXT_SCORE_ENHANCE = 0.35
 
 
 def load_ocr_config():
@@ -176,6 +194,7 @@ def load_ocr_config():
         print(f"[OCR设置] 读取 {OCR_SETTINGS_FILE} 失败，使用默认: {e}")
     cfg["vertical"] = bool(cfg.get("vertical"))
     cfg["traditional"] = bool(cfg.get("traditional"))
+    cfg["enhance"] = bool(cfg.get("enhance", True))
     if cfg.get("punctuate") not in ("off", "rule"):
         cfg["punctuate"] = "off"
     return cfg
@@ -193,11 +212,12 @@ def save_ocr_config(cfg):
 
 def apply_ocr_config(cfg):
     """把 OCR 选项写回全局变量，供 ocr_image 使用。"""
-    global OCR_CFG, VERTICAL, TRADITIONAL, PUNCTUATE
+    global OCR_CFG, VERTICAL, TRADITIONAL, PUNCTUATE, ENHANCE
     OCR_CFG = dict(cfg)
     VERTICAL = bool(OCR_CFG.get("vertical"))
     TRADITIONAL = bool(OCR_CFG.get("traditional"))
     PUNCTUATE = OCR_CFG.get("punctuate", "off")
+    ENHANCE = bool(OCR_CFG.get("enhance", True))
     if TRADITIONAL and not LAYOUT_HAS_OPENCC:
         print("[OCR设置] 已开启“转繁体”，但 opencc-python 未安装，繁体转换将无效（输出原样）。")
 
@@ -582,6 +602,30 @@ WM_HOTKEY_CONFLICT_SHOW = win32con.WM_APP + 7  # 启动后弹“热键冲突”�
 WM_LOG_VIEW_SHOW = win32con.WM_APP + 8  # 由 UI 线程弹出“运行日志”查看窗口
 WM_MONITOR_UPDATE = win32con.WM_APP + 9  # 监控线程 -> UI 线程：刷新结果文本（线程安全）
 WM_MONITOR_START = win32con.WM_APP + 10  # 托盘菜单 -> UI 线程：弹出框选并启动监控
+WM_HOTKEY_SETTINGS_SHOW = win32con.WM_APP + 11  # 由 UI 线程弹出「快捷键设置」弹层
+WM_OCR_SETTINGS_SHOW = win32con.WM_APP + 12     # 由 UI 线程弹出「OCR 选项」弹层
+
+# 自检：所有 WM_APP+n 自定义消息号必须两两唯一。
+# 历史事故：WM_OCR_SETTINGS_SHOW 曾被定义为 WM_APP+6，与 WM_HOTKEY_RELOAD 撞车，
+# 由于 WndProc 先匹配 WM_HOTKEY_RELOAD，导致托盘「OCR 选项...」点了没反应（静默 return）。
+_CUSTOM_MSGS = {
+    "WM_RESULT_SHOW": WM_RESULT_SHOW,
+    "WM_RESULT_HIDE": WM_RESULT_HIDE,
+    "WM_ABOUT_SHOW": WM_ABOUT_SHOW,
+    "WM_HOTKEY_RELOAD": WM_HOTKEY_RELOAD,
+    "WM_HOTKEY_CONFLICT_SHOW": WM_HOTKEY_CONFLICT_SHOW,
+    "WM_LOG_VIEW_SHOW": WM_LOG_VIEW_SHOW,
+    "WM_MONITOR_UPDATE": WM_MONITOR_UPDATE,
+    "WM_MONITOR_START": WM_MONITOR_START,
+    "WM_HOTKEY_SETTINGS_SHOW": WM_HOTKEY_SETTINGS_SHOW,
+    "WM_OCR_SETTINGS_SHOW": WM_OCR_SETTINGS_SHOW,
+}
+_seen_msg_ids = {}
+for _name, _val in _CUSTOM_MSGS.items():
+    _seen_msg_ids.setdefault(_val, []).append(_name)
+for _val, _names in _seen_msg_ids.items():
+    if len(_names) > 1:
+        print(f"[自检] 自定义消息号冲突: {_names} 均为 {_val}（会导致对应托盘菜单项点了没反应）")
 
 
 def _about_text():
@@ -613,6 +657,51 @@ def _bring_to_front(hwnd):
         pass
     try:
         _user32.SetForegroundWindow(int(hwnd))
+    except Exception:
+        pass
+
+
+class _WinRect(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+def _client_size_to_window_size(w, client_h, style):
+    """把“希望的客户区尺寸”换算为“窗口总尺寸”（补上标题栏与边框）。
+
+    背景（历史缺陷）：各弹层的子控件坐标全部以客户区为基准，但 CreateWindow
+    时曾直接把客户区高度当作窗口总高度传入，标题栏 + 边框（约 33px）会吃掉
+    底部一条，导致最下方的“确定 / 取消”等按钮被裁掉——表现为“内容显示不全”。
+    这里用 AdjustWindowRect 精确反算，且能自动适配不同 DPI 与系统主题。
+    """
+    try:
+        r = _WinRect(0, 0, int(w), int(client_h))
+        if ctypes.windll.user32.AdjustWindowRect(ctypes.byref(r), int(style), False):
+            win_w = r.right - r.left
+            win_h = r.bottom - r.top
+            if win_w > 0 and win_h > 0:
+                return win_w, win_h
+    except Exception:
+        pass
+    return int(w), int(client_h) + 40   # 兜底：粗略补一条标题栏的高度
+
+
+def _fit_client_area(hwnd, want_w, want_h, screen_w=None):
+    """把已创建窗口的客户区精确校正到 want_w × want_h，并按需重新水平居中。
+
+    AdjustWindowRect 对各种 style（例如窗口级 WS_VSCROLL）和非 100% DPI 缩放
+    的推算可能与实际客户区存在残差，这里按实测差值补偿一次，兜住所有情况。
+    """
+    try:
+        cur_w, cur_h = win32gui.GetClientRect(hwnd)[2:]
+        if cur_w == want_w and cur_h == want_h:
+            return
+        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        new_w = (r - l) + (want_w - cur_w)
+        new_h = (b - t) + (want_h - cur_h)
+        nx = max(0, (screen_w - new_w) // 2) if screen_w else l
+        win32gui.SetWindowPos(hwnd, 0, nx, t, new_w, new_h,
+                              win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
     except Exception:
         pass
 
@@ -1215,6 +1304,7 @@ class ToastWindow:
         self._inst = None
         self._atom = None
         self._class_name = None
+        self._thread_id = None
 
     def _build(self):
         self._inst = win32api.GetModuleHandle(None)
@@ -1276,6 +1366,15 @@ class ToastWindow:
         win32gui.DeleteObject(hf)
         win32gui.EndPaint(hwnd, ps)
 
+    def _on_timeout(self):
+        """duration 后由 threading.Timer 触发：向本线程投递 WM_TIMER 以关闭。"""
+        try:
+            if self._thread_id is not None:
+                win32gui.PostThreadMessage(
+                    self._thread_id, win32con.WM_TIMER, 1, 0)
+        except Exception:
+            pass
+
     def run(self):
         try:
             self._build()
@@ -1284,7 +1383,10 @@ class ToastWindow:
                 self.hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
                 win32con.SWP_NOMOVE | win32con.SWP_NOSIZE,
             )
-            win32gui.SetTimer(self.hwnd, 1, self.duration, None)
+            # 部分打包环境的 pywin32 不带 win32gui.SetTimer，改用 threading.Timer
+            # 在 duration 毫秒后向本线程投递 WM_TIMER 触发自动关闭。
+            self._thread_id = win32api.GetCurrentThreadId()
+            threading.Timer(self.duration / 1000.0, self._on_timeout).start()
             win32gui.PumpMessages()
         except Exception as e:
             print(f"[Toast] 显示失败: {e}")
@@ -1376,6 +1478,54 @@ def _merge_horizontal(items):
     return "\n".join(lines)
 
 
+def _enhance_for_ocr(img):
+    """弱对比/小字增强：送入 RapidOCR 前做轻量预处理，提升淡灰小字的召回。
+
+    - 弱对比拉伸：仅当图像“近乎全白”（5% 分位仍很浅）时做 min-max 拉伸，把淡灰字
+      拉成高对比；正常黑字截图（5% 分位很低）不受影响，避免无意义拉伸。
+    - 小图放大：短边 < 200px 时按 2~3x 放大（文本识别对 ~48px 以上字高更稳），
+      但限制最大 3x 以免放大噪声。
+
+    返回可直接喂给 RapidOCR 的 BGR 图像；无需处理时返回原图。
+    """
+    if img is None or img.size == 0:
+        return img
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
+    h, w = gray.shape[:2]
+    # 1) 弱对比拉伸：5% 分位仍高于 150 → 文字偏淡，整体被白底主导
+    if np.percentile(gray, 5) > 150:
+        mn, mx = int(gray.min()), int(gray.max())
+        if mx - mn > 1:
+            gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    # 2) 小图放大：短边过小则放大（上限 3x）
+    short = min(h, w)
+    if short > 0 and short < 200:
+        scale = min(3.0, 200.0 / short)
+        gray = cv2.resize(gray, None, fx=scale, fy=scale,
+                          interpolation=cv2.INTER_CUBIC)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def _filter_noise_boxes(items):
+    """丢弃增强降阈值后混入的小尺寸非汉字噪声框（如引号框被识别成 '99'、'|'）。
+
+    判定：框高 < 0.45×中位高，且识别结果不含任何 CJK 字符，且长度 ≤ 2。
+    只针对“极小的非汉字短串”，不会误删正文中的小号汉字或正常标点。
+    """
+    if len(items) < 2:
+        return items
+    heights = sorted(it[3] - it[2] for it in items)
+    med = heights[len(heights) // 2]
+    th = 0.45 * med
+    out = []
+    for it in items:
+        if (it[3] - it[2]) < th and len(it[4].strip()) <= 2 \
+                and not any(_is_cjk(c) for c in it[4]):
+            continue
+        out.append(it)
+    return out
+
+
 def ocr_image(img):
     """对单张 BGR 图像做 OCR，返回换行拼接的文本。
 
@@ -1385,12 +1535,15 @@ def ocr_image(img):
     区域内本来就存在的多行（不同行纵向不重叠，仍各自成行）。
 
     随后按当前 OCR 选项串联后处理：
+      - 弱对比/小字增强：enhance 开启时先做拉伸+放大，并以更低阈值召回（默认开）；
       - 竖排模式：用 layout.reorder_vertical 按“上→下、右→左”重排；
       - 繁体输出：用 OpenCC 简→繁转换；
       - 自动标点：用 layout.add_punctuation 离线规则补句读。
     """
     engine = get_engine()
-    result, _ = engine(img)
+    if ENHANCE:
+        img = _enhance_for_ocr(img)
+    result, _ = engine(img, text_score=TEXT_SCORE_ENHANCE if ENHANCE else TEXT_SCORE_NORMAL)
     if not result:
         return ""
 
@@ -1403,6 +1556,9 @@ def ocr_image(img):
         xs = [float(p[0]) for p in box]
         ys = [float(p[1]) for p in box]
         items.append((min(xs), max(xs), min(ys), max(ys), text))
+    # 增强降阈值后过滤极小非汉字噪声框（避免引号框误识成 '99' 之类）
+    if ENHANCE:
+        items = _filter_noise_boxes(items)
     if not items:
         return ""
 
@@ -2111,12 +2267,9 @@ def stop_monitor_from_tray(icon, item):
 
 # ----------------- 快捷键设置弹层（系统托盘 → 原生对话框） -----------------
 # 弹层由 UI 线程（result_win 所属线程）以嵌套消息循环弹出，避免阻塞托盘回调。
-if HAS_WIN32:
-    WM_HOTKEY_SETTINGS_SHOW = win32con.WM_APP + 5  # 由 UI 线程弹出设置弹层
-    WM_OCR_SETTINGS_SHOW = win32con.WM_APP + 6     # 由 UI 线程弹出 OCR 选项弹层
-else:
-    WM_HOTKEY_SETTINGS_SHOW = 0
-    WM_OCR_SETTINGS_SHOW = 0
+# 注意：WM_HOTKEY_SETTINGS_SHOW / WM_OCR_SETTINGS_SHOW 两个消息号已统一在文件上方
+# “原生结果窗口”常量区集中定义（WM_APP+11 / WM_APP+12），此处不再重复定义，
+# 以免再次与其它 WM_APP+n 撞车（历史事故见上方 _CUSTOM_MSGS 自检注释）。
 
 
 def vk_to_pynput(vk):
@@ -2264,15 +2417,17 @@ class HotkeySettingsDialog:
         wc.hbrBackground = win32con.COLOR_BTNFACE + 1
         self._atom = win32gui.RegisterClass(wc)
 
-        w, h = 520, 530
-        cx = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
-        x = max(0, (cx - w) // 2)
-        y = 110
+        w, h = 520, 530          # w / h 都是“客户区”布局基准尺寸
         style = win32con.WS_POPUP | win32con.WS_CAPTION | win32con.WS_SYSMENU
+        win_w, win_h = _client_size_to_window_size(w, h, style)
+        cx = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+        x = max(0, (cx - win_w) // 2)
+        y = 110
         self.hwnd = win32gui.CreateWindow(
             self._atom, "快捷键设置", style,
-            x, y, w, h, self.owner or 0, 0, self._inst, None,
+            x, y, win_w, win_h, self.owner or 0, 0, self._inst, None,
         )
+        _fit_client_area(self.hwnd, w, h, cx)
         self.header = win32gui.CreateWindow(
             "STATIC",
             "点击「录制」后按下新快捷键；再点一次「录制」可取消。冲突会立即提示。",
@@ -2501,7 +2656,7 @@ _ocr_settings_open = False
 
 
 class OcrSettingsDialog:
-    """系统托盘「OCR 选项」弹层：排版（横/竖）、输出（简/繁）、自动标点（关/规则）。"""
+    """系统托盘「OCR 选项」弹层：排版（横/竖）、输出（简/繁）、自动标点、弱对比增强。"""
 
     def __init__(self, owner):
         self.owner = owner
@@ -2509,6 +2664,7 @@ class OcrSettingsDialog:
         self.chk_vertical = None
         self.chk_traditional = None
         self.chk_punct = None
+        self.chk_enhance = None
         self._inst = None
         self._atom = None
         self.values = dict(OCR_CFG)
@@ -2521,22 +2677,30 @@ class OcrSettingsDialog:
         wc.lpfnWndProc = self._wndproc
         wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
         wc.hbrBackground = win32con.COLOR_BTNFACE + 1
+        # 先尝试注销同名类：上次异常退出未正常注销时会报 1410（类已存在）
+        try:
+            win32gui.UnregisterClass("OCROptionsDlg", self._inst)
+        except Exception:
+            pass
         self._atom = win32gui.RegisterClass(wc)
 
-        w, h = 460, 340
-        cx = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
-        x = max(0, (cx - w) // 2)
-        y = 150
+        w, h = 460, 340          # w / h 都是“客户区”布局基准尺寸
         style = win32con.WS_POPUP | win32con.WS_CAPTION | win32con.WS_SYSMENU
+        win_w, win_h = _client_size_to_window_size(w, h, style)
+        cx = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+        x = max(0, (cx - win_w) // 2)
+        y = 150
         self.hwnd = win32gui.CreateWindow(
             self._atom, "OCR 选项", style,
-            x, y, w, h, self.owner or 0, 0, self._inst, None,
+            x, y, win_w, win_h, self.owner or 0, 0, self._inst, None,
         )
+        _fit_client_area(self.hwnd, w, h, cx)
         win32gui.CreateWindow(
             "STATIC",
             "竖排：按“上→下、右→左”重排（古籍/字幕）\n"
             "繁体：简体→繁体（OpenCC 离线）\n"
-            "标点：离线规则补句读（保守，供初稿）",
+            "标点：离线规则补句读（保守，供初稿）\n"
+            "增强：淡灰/小字截图自动拉伸放大，降低漏识（默认开）",
             win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.SS_LEFT,
             20, 14, w - 40, 64, self.hwnd, 10, self._inst, None,
         )
@@ -2555,18 +2719,25 @@ class OcrSettingsDialog:
             win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_AUTOCHECKBOX,
             24, 158, 400, 28, self.hwnd, 3, self._inst, None,
         )
+        self.chk_enhance = win32gui.CreateWindow(
+            "BUTTON", "弱对比/小字增强（淡灰字拉伸 + 小图放大 + 降阈值）",
+            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.BS_AUTOCHECKBOX,
+            24, 192, 400, 28, self.hwnd, 4, self._inst, None,
+        )
         win32gui.SendMessage(self.chk_vertical, win32con.BM_SETCHECK,
                              1 if self.values.get("vertical") else 0, 0)
         win32gui.SendMessage(self.chk_traditional, win32con.BM_SETCHECK,
                              1 if self.values.get("traditional") else 0, 0)
         win32gui.SendMessage(self.chk_punct, win32con.BM_SETCHECK,
                              1 if self.values.get("punctuate") == "rule" else 0, 0)
+        win32gui.SendMessage(self.chk_enhance, win32con.BM_SETCHECK,
+                             1 if self.values.get("enhance", True) else 0, 0)
         try:
             lf = win32gui.LOGFONT()
             lf.lfHeight = -15
             lf.lfFaceName = "Microsoft YaHei"
             hf = win32gui.CreateFontIndirect(lf)
-            for hw in (self.chk_vertical, self.chk_traditional, self.chk_punct):
+            for hw in (self.chk_vertical, self.chk_traditional, self.chk_punct, self.chk_enhance):
                 win32gui.SendMessage(hw, win32con.WM_SETFONT, hf, 1)
         except Exception:
             pass
@@ -2606,10 +2777,13 @@ class OcrSettingsDialog:
             self.chk_traditional, win32con.BM_GETCHECK, 0, 0) == 1
         punct = win32gui.SendMessage(
             self.chk_punct, win32con.BM_GETCHECK, 0, 0) == 1
+        enhance = win32gui.SendMessage(
+            self.chk_enhance, win32con.BM_GETCHECK, 0, 0) == 1
         cfg = {
             "vertical": vertical,
             "traditional": traditional,
             "punctuate": "rule" if punct else "off",
+            "enhance": enhance,
         }
         apply_ocr_config(cfg)
         save_ocr_config(cfg)
@@ -2643,7 +2817,13 @@ class OcrSettingsDialog:
 
 
 def open_ocr_settings(owner_hwnd):
-    """在 UI 线程弹出「OCR 选项」弹层（嵌套消息循环）。"""
+    """在独立线程弹出「OCR 选项」弹层（独立消息循环，避免嵌套重入）。
+
+    注意：本函数由 result_win 的 WndProc（WM_OCR_SETTINGS_SHOW）调用，
+    若在 WndProc 内同步跑 PumpMessages 会形成嵌套消息循环，在冻结环境
+    下弹窗消息可能不被分发，表现为“点了没反应”。改为独立线程跑弹窗
+    自己的消息循环，主线程（result_win）不受影响，弹窗也能正常交互。
+    """
     global _ocr_settings_open
     if _ocr_settings_open:
         return  # 防止重复打开
@@ -2651,13 +2831,18 @@ def open_ocr_settings(owner_hwnd):
         print("[OCR设置] 需要 pywin32（Windows）才能打开设置窗口。")
         return
     _ocr_settings_open = True
-    try:
-        dlg = OcrSettingsDialog(owner_hwnd)
-        dlg.run()
-    except Exception as e:
-        print(f"[OCR设置] 打开失败: {e}")
-    finally:
-        _ocr_settings_open = False
+
+    def _runner():
+        try:
+            dlg = OcrSettingsDialog(owner_hwnd)
+            dlg.run()
+        except Exception as e:
+            print(f"[OCR设置] 打开失败: {e}")
+        finally:
+            global _ocr_settings_open
+            _ocr_settings_open = False
+
+    threading.Thread(target=_runner, daemon=True).start()
 
 
 def open_ocr_settings_from_tray(icon, item):
@@ -2763,16 +2948,18 @@ class LogViewerDialog:
         wc.hbrBackground = win32con.COLOR_BTNFACE + 1
         self._atom = win32gui.RegisterClass(wc)
 
-        w, h = 640, 480
-        cx = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
-        x = max(0, (cx - w) // 2)
-        y = 90
+        w, h = 640, 480          # w / h 都是“客户区”布局基准尺寸
         style = (win32con.WS_POPUP | win32con.WS_CAPTION | win32con.WS_SYSMENU
                  | win32con.WS_THICKFRAME | win32con.WS_VSCROLL)
+        win_w, win_h = _client_size_to_window_size(w, h, style)
+        cx = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+        x = max(0, (cx - win_w) // 2)
+        y = 90
         self.hwnd = win32gui.CreateWindow(
             self._atom, "运行日志 - ocrclient.log", style,
-            x, y, w, h, self.owner or 0, 0, self._inst, None,
+            x, y, win_w, win_h, self.owner or 0, 0, self._inst, None,
         )
+        _fit_client_area(self.hwnd, w, h, cx)
         self.edit = win32gui.CreateWindow(
             "EDIT", "",
             win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.WS_BORDER
@@ -2867,6 +3054,22 @@ class LogViewerDialog:
 def main():
     if "--version" in sys.argv:
         print(f"PickText {__version__}")
+        return
+    if "--selftest" in sys.argv:
+        # 仅初始化 OCR 引擎并退出（用于验证打包后 rapidocr 子模块可被正确动态导入）
+        try:
+            eng = get_engine()
+            _msg = f"[selftest] 引擎初始化成功: {type(eng).__name__}\n[selftest] OK"
+        except Exception as _e:
+            import traceback
+            _msg = f"[selftest] 失败:\n{traceback.format_exc()}"
+        print(_msg)
+        try:
+            _p = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "selftest_result.txt")
+            with open(_p, "w", encoding="utf-8") as _f:
+                _f.write(_msg)
+        except Exception:
+            pass
         return
     # 桌面应用形态：打包后（frozen）默认启用系统托盘；可用 --tray 强制、--no-tray 禁用
     force_tray = "--tray" in sys.argv

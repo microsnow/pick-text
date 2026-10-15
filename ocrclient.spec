@@ -19,6 +19,7 @@ rapidocr_datas = collect_data_files("rapidocr_onnxruntime")
 hidden_imports = (
     collect_submodules("pynput")
     + collect_submodules("pystray")
+    + collect_submodules("rapidocr_onnxruntime")  # ch_ppocr_v3_det/rec/cls 靠动态导入，必须显式收集
 )
 
 a = Analysis(

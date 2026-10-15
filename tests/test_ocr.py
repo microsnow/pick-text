@@ -5,6 +5,7 @@
 """
 import os
 import sys
+import cv2
 import numpy as np
 
 # 把项目根目录加入 import 路径，使 `import main` 可用
@@ -142,4 +143,43 @@ def test_to_traditional():
         # 未安装 OpenCC 时退化为原样，但不报错
         assert layout.to_traditional("汉字") == "汉字"
     assert layout.to_traditional("") == ""
+
+
+def test_filter_noise_boxes_keeps_cjk():
+    # 正常：大号汉字框保留；极小的非汉字短串（引号框误识成 99）被丢弃
+    items = [
+        (13, 33, 18, 37, "吃"),                 # 正文汉字，保留
+        (89, 164, 16, 39, "时间到→"),          # 正文，保留
+        (70, 76, 20, 25, "99"),                # 极小非汉字噪声，丢弃
+    ]
+    out = main._filter_noise_boxes(items)
+    texts = [t[4] for t in out]
+    assert "吃" in texts and "时间到→" in texts
+    assert "99" not in texts
+
+
+def test_filter_noise_boxes_keeps_tiny_cjk_punct():
+    # 极小的“汉字标点”不丢：只要含 CJK 字符就保留
+    items = [
+        (89, 164, 16, 39, "正文"),
+        (70, 76, 20, 25, "，"),                 # 含 CJK 标点，保留
+    ]
+    out = main._filter_noise_boxes(items)
+    assert "，" in [t[4] for t in out]
+
+
+def test_filter_noise_boxes_single_box_passthrough():
+    # 只有一个框时不过滤（避免误删唯一结果）
+    items = [(70, 76, 20, 25, "99")]
+    assert main._filter_noise_boxes(items) == items
+
+
+def test_enhance_for_ocr_small_faint_image():
+    # 淡灰小图 → 经增强后整体动态范围被拉满（min≈0, max≈255）
+    img = np.full((40, 120, 3), 200, dtype=np.uint8)   # 浅灰底
+    cv2.rectangle(img, (10, 10), (30, 30), (170, 170, 170), -1)  # 略深的“字”
+    out = main._enhance_for_ocr(img)
+    g = out[:, :, 0] if out.ndim == 3 else out
+    assert int(g.min()) < 30 and int(g.max()) > 220
+
 
