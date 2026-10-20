@@ -1,0 +1,79 @@
+name: 报告 Bug
+description: 识别异常、快捷键失效、程序崩溃、托盘菜单无响应等
+title: "[Bug] "
+labels: ["bug"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。**请务必附上「运行日志」**——托盘右键 →「运行日志」→「复制全部」。
+        它通常能直接定位问题（热键被占用、剪贴板校验失败、OCR 异常都会写在这里）。
+
+  - type: checkboxes
+    id: precheck
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已在 Issues 中搜索过，没有重复问题
+          required: true
+        - label: 我使用的是最新 Release 版本
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 拾字版本
+      description: Release 页的版本号，或 `OCRClient.exe --version` 的输出
+      placeholder: v2.0.1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runmode
+    attributes:
+      label: 运行方式
+      options:
+        - 便携版 OCRClient.exe（Release 下载的 zip）
+        - 源码直跑（python main.py）
+        - 自己用 PyInstaller 打包的
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Windows 版本
+      description: "winver 对话框中显示的完整版本号"
+      placeholder: Windows 11 23H2 (22631.4317)
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 越具体越好，写明按了哪个键、屏幕上是什么界面
+      placeholder: |
+        1. 按 Ctrl+Shift+1 框选视频字幕条
+        2. 按 Alt+Shift+1
+        3. 期望：Toast 提示已复制；实际：红色 Toast「未识别到文字」
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: 运行日志
+      description: 托盘右键 →「运行日志」→「复制全部」；源码直跑则粘贴控制台输出
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: display
+    attributes:
+      label: 显示器配置（可选，但多屏/缩放问题非常需要）
+      placeholder: 双屏 2560x1440 @150% + 1920x1080 @100%，选区定义在第二屏
+    validations:
+      required: false

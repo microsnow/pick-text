@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: 使用问题 / 场景交流
+    url: https://github.com/microsnow/pick-text/discussions
+    about: 不是 bug 的用法咨询、屏幕取字的折腾经验、你想用拾字做什么——都发在这里
+
+  - name: 先读 README
+    url: https://github.com/microsnow/pick-text#readme
+    about: 快捷键、选区预设、监控模式、OCR 选项与常见问题都在 README 里

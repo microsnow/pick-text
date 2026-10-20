@@ -1,0 +1,48 @@
+name: 功能建议
+description: 想要的新能力、场景需求、体验改进
+title: "[Feature] "
+labels: ["enhancement"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提之前先看一下[贡献指南](https://github.com/microsnow/pick-text/blob/main/CONTRIBUTING.md)里的**范围约定**：
+        本项目坚持 Windows 原生 + 轻依赖，不接受引入 GUI 框架、Web 服务、跨平台抽象层。
+
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 你遇到的场景
+      description: 先说场景，再说功能。这是什么工作流？一天会发生几次？
+      placeholder: 我每天要把 ERP 里同一列的单号抄进表格，大概 80 次...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你希望它怎么工作
+      placeholder: 希望定义选区时能指定「只取第 2 列」，或者识别结果能直接追加到某个文件...
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: 现在你怎么凑合解决的（可选）
+      description: 有 workaround 说明需求是真实的
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 你觉得这属于
+      options:
+        - 现有功能的改进（小的）
+        - 新功能（中等）
+        - 新方向 / 集成（CLI、MCP、Webhook 等）
+        - 不确定
+    validations:
+      required: true

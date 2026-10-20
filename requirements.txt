@@ -1,7 +1,10 @@
 mss>=9.0.0
-rapidocr-onnxruntime>=1.3.0
+# 注意：rapidocr-onnxruntime 1.3.x / 1.4.x 均声明 Requires-Python <3.13，
+# 在 Python 3.13 上 pip 会直接报 "No matching distribution found"。
+# 1.2.3 是最后一个支持 3.13 的版本，也是当前发布包实际打包所用的版本，
+# 故在此显式封顶，避免升级到装不上或行为不一致的版本。
+rapidocr-onnxruntime>=1.2.3,<1.3
 pyperclip>=1.8.2
 numpy>=1.24.0
 pywin32>=308
 opencc>=1.1.6
-

@@ -37,3 +37,8 @@ exports/
 
 # 自测/临时产物
 selftest_result.txt
+
+# 内部增长分析（含竞品对比与分发策略，不进公开仓库）
+docs/GROWTH-PLAN.md
+docs/TODO.md
+
