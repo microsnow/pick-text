@@ -1,0 +1,54 @@
+MIT No Attribution
+
+Copyright (c) 2026 PickText contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---
+
+中文说明（非法律条款，以英文原文为准）
+
+本项目采用 MIT No Attribution（MIT-0）许可证。你可以：
+
+  - 免费用于商业用途（含闭源商业集成、收费分发、内网部署）
+  - 免费修改、二次创作
+  - 无需署名        —— 不必在衍生作品中标注原作者或项目名
+  - 无需声明来源    —— 不必附带本许可证声明
+  - 无需开源衍生作品 —— 基于本项目的代码可以是完全闭源的
+  - 无需申请授权    —— 上述权限自本文件存在之日起对所有人自动生效
+
+唯一的约束：
+
+  本软件按"原样"提供，不附带任何明示或默示的担保（包括但不限于对适销性、
+  特定用途适用性的担保）。作者与贡献者不对因使用或无法使用本软件而产生的
+  任何直接、间接、偶然、特殊或后果性损害承担责任。
+
+简而言之：拿去用、拿去改、拿去卖，不必问、不必谢、不必还。
+
+第三方依赖说明
+------------
+
+本项目自身代码适用上述 MIT-0 许可，但其运行时依赖的第三方库各自适用其原始
+许可证，互不冲突（均为允许闭源商业集成的宽松型许可）。分发本项目或其衍生
+作品时，请一并留意 THIRD_PARTY_NOTICES.md 中的完整清单，其中要点：
+
+  - Apache-2.0 依赖（RapidOCR、OpenCC、OpenCV 等）要求在再分发时保留其版权
+    声明与 NOTICE
+  - MIT / BSD / PSF / Zlib 依赖要求保留其各自的版权声明
+  - pystray 为 LGPL-3.0-or-later（系统托盘图标）：LGPL 允许闭源链接与商业
+    集成，仅要求用户可替换该库。本项目按原样使用、未作修改，且通过标准 pip
+    依赖机制引入，可替换性由生态保证
+
+这些声明义务针对的是第三方库的代码本身，不影响你对自己代码的完全支配权——
+你的作品依然无需署名、无需开源、可自由闭源商用。

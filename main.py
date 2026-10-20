@@ -22,13 +22,15 @@
    - 之后按 Alt+Shift+N 一键自动截该区域 → OCR → 静默复制到剪贴板，无需每次重画。
    - 适合反复取同一处固定文字（字幕条、计时器、比分牌、表单框等）。
 
-依赖：mss / rapidocr-onnxruntime / pynput / pyperclip / numpy / pywin32
+依赖：mss / rapidocr-onnxruntime / pyperclip / numpy / pywin32
 
 运行（在隔离 venv 中）：
     python main.py
+
+开源许可：MIT-0（见仓库根目录 LICENSE）。可自由商用、修改、闭源分发，无需署名。
 """
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 import os
 import sys
@@ -42,7 +44,6 @@ import numpy as np
 import cv2
 import mss
 import pyperclip
-from pynput import keyboard
 from rapidocr_onnxruntime import RapidOCR
 
 # PyInstaller 兼容：rapidocr-onnxruntime 在运行时用 importlib.import_module("ch_ppocr_v3_det")
@@ -298,45 +299,122 @@ def build_hotkey_map():
     return m
 
 
-# ----------------- Esc 关闭/取消键：独立键盘钩子 -----------------
-# RegisterHotKey 无法注册“裸键”（无修饰键），而用户常用的“按 Esc 关闭/取消当前弹窗”
-# 正是裸键。这里用一个轻量键盘钩子只监听 Esc，复用 pynput；钩子非独占，但回调仅在
-# 本程序有活动窗口时才动作（on_activate_esc_close 内部已判断），与其它软件共存无碍。
-_esc_listener = None
+# ----------------- Esc 关闭/取消键：Win32 原生低级键盘钩子 -----------------
+# RegisterHotKey 无法注册"裸键"（无修饰键），而用户常用的"按 Esc 关闭/取消当前弹窗"
+# 正是裸键。这里用 Win32 低级键盘钩子（WH_KEYBOARD_LL）只监听 Esc；钩子非独占，
+# 且回调仅做 PostMessage（跨线程安全，不阻塞钩子链），与其它软件共存无碍。
+#
+# 为什么不用 pynput（历史）：pynput 依赖较重且其 Windows 后端需要 python-xlib 生态，
+# 而本项目只要一个裸键监听。为此改用 ctypes 直调 user32.dll 的 WH_KEYBOARD_LL，
+# 既少一个第三方依赖，也避免为单一功能引入一整条依赖链。
+#
+# 线程模型：低级键盘钩子的回调在【安装钩子的线程】上执行（须有消息循环）。
+# 本钩子在 UI 线程（ui_loop → start_esc_listener）安装，随 PumpMessages 泵消息。
+# 回调内只 PostMessage 把动作转交给 UI 线程处理，避免在钩子上下文里做耗时操作
+# （耗时会导致 Windows 静默摘除钩子：LowLevelHooksTimeout）。
+_esc_hook_hhk = None        # SetWindowsHookEx 返回的钩子句柄（HHOOK）
+_esc_hook_proc = None       # 回调的 ctypes 包装对象，必须持有强引用防被 GC
+
+# 指针宽度整型：LPARAM 在 64 位下是 8 字节。若误用 wintypes.LPARAM（有符号 32 位），
+# 指针会被截断，读取 KBDLLHOOKSTRUCT.vkCode 得到的是地址碎片而非真实按键码。
+_LRESULT = ctypes.c_ssize_t
+_HOOKPROC = ctypes.WINFUNCTYPE(_LRESULT, ctypes.c_int, wintypes.WPARAM, ctypes.c_ssize_t)
+
+_HOOK_USER32 = None
 
 
-def _on_esc_press(key):
+class _KBDLLHOOKSTRUCT(ctypes.Structure):
+    """KBDLLHOOKSTRUCT：低级键盘钩子回调的 lParam 所指向的结构（x64 下 24 字节）。"""
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+def _hook_user32():
+    """惰性加载 user32.dll 的钩子相关签名（签名缺失会导致整数参数被截断/溢出）。"""
+    global _HOOK_USER32
+    if _HOOK_USER32 is not None:
+        return _HOOK_USER32
+    u = ctypes.WinDLL("user32", use_last_error=True)
+    u.SetWindowsHookExW.restype = wintypes.HHOOK
+    u.SetWindowsHookExW.argtypes = (
+        ctypes.c_int, _HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD)
+    u.CallNextHookEx.restype = _LRESULT
+    u.CallNextHookEx.argtypes = (
+        wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, ctypes.c_ssize_t)
+    u.UnhookWindowsHookEx.restype = wintypes.BOOL
+    u.UnhookWindowsHookEx.argtypes = (wintypes.HHOOK,)
+    _HOOK_USER32 = u
+    return _HOOK_USER32
+
+
+def _on_keyboard_ll(code, wparam, lparam):
+    """低级键盘钩子回调：只认 Esc 按下，其余一律透传给下一个钩子/目标程序。"""
     try:
-        if key == keyboard.Key.esc:
-            on_activate_esc_close()
+        # nCode < 0 表示钩子出错的被动通知，必须原样传给 CallNextHookEx
+        if code == 0 and wparam in (win32con.WM_KEYDOWN, win32con.WM_SYSKEYDOWN):
+            vk = ctypes.cast(lparam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents.vkCode
+            if vk == win32con.VK_ESCAPE:
+                # 不直接执行动作：转交 UI 线程消息队列，保持钩子回调极快
+                _post_esc_close()
     except Exception as e:
-        print(f"[Esc] 回调异常: {e}")
+        # 钩子内异常会向 stderr 泄漏并可能摘除钩子，吞掉即可（Esc 不是关键路径）
+        print(f"[Esc] 钩子回调异常: {e}")
+    try:
+        return _hook_user32().CallNextHookEx(None, code, wparam, lparam)
+    except Exception:
+        return 0
+
+
+def _post_esc_close():
+    """把 Esc 转成窗口消息交给 UI 线程（与热键同一路径，复用 on_activate_esc_close）。"""
+    try:
+        if result_win is not None and getattr(result_win, "hwnd", None):
+            win32gui.PostMessage(result_win.hwnd, WM_ESC_CLOSE, 0, 0)
+    except Exception:
+        pass
 
 
 def start_esc_listener():
-    """启动 Esc 钩子（仅当关闭键为裸键时才有意义；始终启动以覆盖默认 <esc>）。"""
-    global _esc_listener
-    if _esc_listener is not None:
+    """安装低级键盘钩子监听 Esc。必须在带消息循环的线程中调用（UI 线程）。"""
+    global _esc_hook_hhk, _esc_hook_proc
+    if _esc_hook_hhk is not None:
+        return
+    if not HAS_WIN32:
         return
     try:
-        _esc_listener = keyboard.Listener(on_press=_on_esc_press)
-        _esc_listener.start()
+        u = _hook_user32()
+        _esc_hook_proc = _HOOKPROC(_on_keyboard_ll)   # 必须保留引用，否则被 GC 后钩子失效
+        # hMod 传 NULL：低级钩子不依赖模块句柄；传模块句柄在部分环境下会失败(err 126)
+        _esc_hook_hhk = u.SetWindowsHookExW(
+            win32con.WH_KEYBOARD_LL, _esc_hook_proc, None, 0)
+        if not _esc_hook_hhk:
+            raise ctypes.WinError(ctypes.get_last_error())
+        print("[Esc] 低级键盘钩子已安装。")
     except Exception as e:
-        print(f"[Esc] 监听器启动失败（Esc 关闭功能将不可用）: {e}")
+        _esc_hook_hhk = None
+        _esc_hook_proc = None
+        print(f"[Esc] 钩子安装失败（Esc 关闭功能将不可用）: {e}")
 
 
 def stop_esc_listener():
-    global _esc_listener
-    if _esc_listener is not None:
+    """卸载键盘钩子并释放回调引用。"""
+    global _esc_hook_hhk, _esc_hook_proc
+    if _esc_hook_hhk is not None:
         try:
-            _esc_listener.stop()
+            _hook_user32().UnhookWindowsHookEx(_esc_hook_hhk)
         except Exception:
             pass
-        _esc_listener = None
+        _esc_hook_hhk = None
+    _esc_hook_proc = None
 
 
 def _parse_hotkey(hk):
-    """把 pynput 风格热键串（如 '<cmd>+<alt>+o'）解析为 (mods, vk)。
+    """把热键串（如 '<cmd>+<alt>+o'）解析为 (mods, vk)。
 
     返回 win32 MOD_* 修饰符与虚拟键码；解析失败抛 ValueError。
     """
@@ -604,6 +682,7 @@ WM_MONITOR_UPDATE = win32con.WM_APP + 9  # 监控线程 -> UI 线程：刷新结
 WM_MONITOR_START = win32con.WM_APP + 10  # 托盘菜单 -> UI 线程：弹出框选并启动监控
 WM_HOTKEY_SETTINGS_SHOW = win32con.WM_APP + 11  # 由 UI 线程弹出「快捷键设置」弹层
 WM_OCR_SETTINGS_SHOW = win32con.WM_APP + 12     # 由 UI 线程弹出「OCR 选项」弹层
+WM_ESC_CLOSE = win32con.WM_APP + 13             # 低级键盘钩子 -> UI 线程：Esc 关闭/取消
 
 # 自检：所有 WM_APP+n 自定义消息号必须两两唯一。
 # 历史事故：WM_OCR_SETTINGS_SHOW 曾被定义为 WM_APP+6，与 WM_HOTKEY_RELOAD 撞车，
@@ -619,6 +698,7 @@ _CUSTOM_MSGS = {
     "WM_MONITOR_START": WM_MONITOR_START,
     "WM_HOTKEY_SETTINGS_SHOW": WM_HOTKEY_SETTINGS_SHOW,
     "WM_OCR_SETTINGS_SHOW": WM_OCR_SETTINGS_SHOW,
+    "WM_ESC_CLOSE": WM_ESC_CLOSE,
 }
 _seen_msg_ids = {}
 for _name, _val in _CUSTOM_MSGS.items():
@@ -909,6 +989,14 @@ class ResultWindow:
             except Exception as e:
                 print(f"[监控] 启动异常: {e}")
             return 0
+        if msg == WM_ESC_CLOSE:
+            # 低级键盘钩子（运行在 UI 线程）捕获 Esc，转交给与热键相同的处理逻辑。
+            # 钩子回调只发消息不干活，避免在钩子上下文做耗时操作被系统摘钩。
+            try:
+                on_activate_esc_close()
+            except Exception as e:
+                print(f"[Esc] 处理异常: {e}")
+            return 0
         if msg == win32con.WM_COMMAND:
             ctrl_id = wparam & 0xFFFF
             if ctrl_id == 2:          # “复制全部”按钮（复制当前编辑框内容，含用户修改）
@@ -1042,7 +1130,7 @@ class ResultWindow:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
             print(f"[OCR] 已导出到 {path}")
-            show_toast(f"已导出: {os.path.basename(path)}")
+            show_toast(f"已导出: {os.path.basename(path)}", kind="ok")
         except Exception as e:
             print(f"[OCR] 导出失败: {e}")
 
@@ -1296,10 +1384,12 @@ class ToastWindow:
     互不干扰；显示 duration 毫秒后自动隐藏并退出消息循环。
     """
 
-    def __init__(self, text, x, y, w, h, duration_ms):
+    def __init__(self, text, x, y, w, h, duration_ms, kind="info"):
         self.text = text
         self.x, self.y, self.w, self.h = x, y, w, h
         self.duration = duration_ms
+        # kind: "ok" 成功(青) / "error" 失败(红) / "info" 中性(青灰)
+        self.kind = kind
         self.hwnd = None
         self._inst = None
         self._atom = None
@@ -1342,15 +1432,26 @@ class ToastWindow:
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
     def _paint(self, hwnd):
+        # 按 kind 选语义色：成功=青、失败=红、中性=蓝灰
+        accent = {
+            "ok": (0, 191, 255),
+            "error": (255, 92, 92),
+        }.get(self.kind, (150, 165, 185))
         hdc, ps = win32gui.BeginPaint(hwnd)
         brush = win32gui.CreateSolidBrush(win32api.RGB(30, 30, 30))
         win32gui.FillRect(hdc, (0, 0, self.w, self.h), brush)
         win32gui.DeleteObject(brush)
-        pen = win32gui.CreatePen(win32con.PS_SOLID, 1, win32api.RGB(0, 191, 255))
+        # Rectangle 会用「DC 当前选中的画刷」填充内部，而 FillRect 只是临时使用
+        # 传入的画刷、不会改变当前画刷。不先切到 NULL_BRUSH 的话，默认白色画刷
+        # 会把刚铺好的深色底重新刷成白色 —— 白字落在白底上，等于什么都没显示。
+        null_brush = win32gui.GetStockObject(win32con.NULL_BRUSH)
+        old_brush = win32gui.SelectObject(hdc, null_brush)
+        pen = win32gui.CreatePen(win32con.PS_SOLID, 2, win32api.RGB(*accent))
         old = win32gui.SelectObject(hdc, pen)
-        win32gui.Rectangle(hdc, 0, 0, self.w - 1, self.h - 1)
+        win32gui.Rectangle(hdc, 1, 1, self.w - 2, self.h - 2)
         win32gui.SelectObject(hdc, old)
         win32gui.DeleteObject(pen)
+        win32gui.SelectObject(hdc, old_brush)   # 还原画刷，供后续文字绘制使用
         lf = win32gui.LOGFONT()
         lf.lfHeight = -16
         lf.lfFaceName = "Microsoft YaHei"
@@ -1367,27 +1468,52 @@ class ToastWindow:
         win32gui.EndPaint(hwnd, ps)
 
     def _on_timeout(self):
-        """duration 后由 threading.Timer 触发：向本线程投递 WM_TIMER 以关闭。"""
+        """duration 后由 threading.Timer 触发：向本窗口投递 WM_TIMER 以关闭。
+
+        必须用 PostMessage(hwnd, ...) 而不能是 PostThreadMessage(thread_id, ...)：
+        后者投递的消息 hwnd 为 NULL，DispatchMessage 不会把它分发给任何窗口过程，
+        WM_TIMER 就永远到不了 _wndproc，不会 PostQuitMessage，消息循环死等 ——
+        表现为 toast 停在屏幕上不消失。
+        """
+        try:
+            if self.hwnd and win32gui.IsWindow(self.hwnd):
+                win32gui.PostMessage(self.hwnd, win32con.WM_TIMER, 1, 0)
+        except Exception:
+            pass
+
+    def _force_quit(self):
+        """兜底退出：直接结束本线程的消息循环（WM_QUIT 不需要窗口过程参与）。"""
         try:
             if self._thread_id is not None:
                 win32gui.PostThreadMessage(
-                    self._thread_id, win32con.WM_TIMER, 1, 0)
+                    self._thread_id, win32con.WM_QUIT, 0, 0)
         except Exception:
             pass
 
     def run(self):
         try:
             self._build()
+            self._thread_id = win32api.GetCurrentThreadId()
             win32gui.ShowWindow(self.hwnd, win32con.SW_SHOWNOACTIVATE)
             win32gui.SetWindowPos(
                 self.hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
                 win32con.SWP_NOMOVE | win32con.SWP_NOSIZE,
             )
-            # 部分打包环境的 pywin32 不带 win32gui.SetTimer，改用 threading.Timer
-            # 在 duration 毫秒后向本线程投递 WM_TIMER 触发自动关闭。
-            self._thread_id = win32api.GetCurrentThreadId()
-            threading.Timer(self.duration / 1000.0, self._on_timeout).start()
+            # pywin32 未提供 win32gui.SetTimer，故用 threading.Timer 在 duration
+            # 毫秒后经 PostMessage 向本窗口投递 WM_TIMER 触发自动关闭。
+            # 定时器设为 daemon，避免卡住进程退出。
+            timer = threading.Timer(self.duration / 1000.0, self._on_timeout)
+            timer.daemon = True
+            timer.start()
+            # 兜底：万一 WM_TIMER 未能触发关闭（异常/消息丢失），到时后直接
+            # 给本线程投递 WM_QUIT 结束消息循环，绝不让 toast 永久留在屏幕上。
+            watchdog = threading.Timer(
+                self.duration / 1000.0 + 1.5, self._force_quit)
+            watchdog.daemon = True
+            watchdog.start()
             win32gui.PumpMessages()
+            for t in (timer, watchdog):
+                t.cancel()
         except Exception as e:
             print(f"[Toast] 显示失败: {e}")
         finally:
@@ -1403,14 +1529,18 @@ class ToastWindow:
                 pass
 
 
-def show_toast(text, duration_ms=1600):
+def show_toast(text, duration_ms=1600, kind="info"):
     """弹出一行轻量提示（不抢焦点，duration 毫秒后自动消失）。
 
+    kind 决定边框语义色："ok" 成功(青) / "error" 失败(红) / "info" 中性(蓝灰)。
+    失败提示默认停留更久（用户往往没看清就消失了）。
     无 pywin32 时退回控制台打印。
     """
     if not HAS_WIN32:
         print(f"[Toast] {text}")
         return
+    if kind == "error" and duration_ms < 2600:
+        duration_ms = 2600      # 失败信息停留久一点，便于看清原因
     # 先按字体量出文字尺寸，决定浮层宽高
     try:
         hdc = win32gui.GetDC(0)
@@ -1435,7 +1565,7 @@ def show_toast(text, duration_ms=1600):
     cy = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
     x = max(20, (cx - w) // 2)
     y = max(20, cy - h - 80)
-    toast = ToastWindow(text, x, y, w, h, duration_ms)
+    toast = ToastWindow(text, x, y, w, h, duration_ms, kind=kind)
     threading.Thread(target=toast.run, daemon=True).start()
 
 
@@ -1580,14 +1710,20 @@ def do_ocr():
 
         if text.strip():
             if AUTO_COPY_ALL:
-                pyperclip.copy(_crlf(text))
+                _ok, _detail = _copy_to_clipboard(_crlf(text))
+            else:
+                _ok, _detail = True, ""
             dt = (time.time() - t0) * 1000
             print(f"[OCR] 识别 {len(text.splitlines())} 行，用时 {dt:.0f}ms"
-                  + ("，已复制全部到剪贴板。" if AUTO_COPY_ALL else "。"))
+                  + ("，已复制全部到剪贴板" + _detail + "。" if AUTO_COPY_ALL else "。"))
             if SHOW_WINDOW:
                 result_win.show(text)
         else:
             print("[OCR] 未识别到文字。")
+            # 与区域/触发模式保持一致：识别为空即清空剪贴板，
+            # 避免用户粘贴到上一次的旧文本而误判本次失败。
+            if AUTO_COPY_ALL:
+                _copy_to_clipboard("", verify=False)   # 清空并记录失败详情
     except Exception as e:
         print(f"[OCR] 出错: {e}")
     finally:
@@ -1637,16 +1773,22 @@ def do_region_ocr():
 
         if text.strip():
             if AUTO_COPY_ALL:
-                pyperclip.copy(_crlf(text))
+                _ok, _detail = _copy_to_clipboard(_crlf(text))
+            else:
+                _ok, _detail = True, ""
             dt = (time.time() - t0) * 1000
             n_lines = len(text.splitlines())
             print(f"[区域OCR] {len(rects)} 个区域 → 识别 {n_lines} 行，"
                   f"用时 {dt:.0f}ms"
-                  + ("，已复制全部到剪贴板。" if AUTO_COPY_ALL else "。"))
+                  + ("，已复制全部到剪贴板" + _detail + "。" if AUTO_COPY_ALL else "。"))
             if SHOW_WINDOW:
                 result_win.show(text)
         else:
+            # 同trigger_preset：识别为空时清空剪贴板，避免用户 Ctrl+V 粘到上一次的
+            # 旧文本而误判本次失败。剪贴板内容与"本次结果"必须严格一致。
             print("[区域OCR] 未识别到文字。")
+            if AUTO_COPY_ALL:
+                _copy_to_clipboard("", verify=False)   # 清空并记录失败详情
     except Exception as e:
         print(f"[区域OCR] 出错: {e}")
     finally:
@@ -1699,6 +1841,71 @@ def do_define_preset(slot):
         _lock.release()
 
 
+def _copy_to_clipboard(text, retries=3, verify=True):
+    """把文本写入剪贴板，并**写后读回校验**。
+
+    为什么需要校验：Windows 剪贴板是全局共享资源，`pyperclip.copy()` 在
+    下列情况会**静默失败**（不抛异常、不写内容），而调用方仍会以为复制成功：
+      - 剪贴板被其它程序短暂独占（OpenClipboard 返回 0）；
+      - 目标应用（如 RDP、某些输入法、远程桌面）劫持/延迟渲染；
+      - 内容含特殊字符导致写入被截断。
+    此时用户 Ctrl+V 得到的是上一次的旧内容或空——非常难排查。
+
+    做法：写入后立即读回比对，不一致则重试；全部失败才返回 False。
+    返回 (ok: bool, detail: str)，detail 为可写入日志的说明。
+
+    verify=False 时退化为单次写入（用于"清空剪贴板"这类本就不该有内容的场景）。
+    """
+    expect = text if verify else ""
+    last_err = ""
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            pyperclip.copy(text)
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            time.sleep(0.05 * attempt)
+            continue
+        if not verify:
+            return True, ""
+        # 读回校验：pyperclip 的写入在 Windows 上是异步的，稍等再读
+        time.sleep(0.02)
+        try:
+            got = pyperclip.paste()
+        except Exception as e:
+            last_err = f"读回失败 {type(e).__name__}: {e}"
+            time.sleep(0.05 * attempt)
+            continue
+        if got == expect:
+            return True, "" if attempt == 1 else f"（第{attempt}次尝试才成功）"
+        # 不一致：记录差异细节，日志里就能看出是"少了"还是"被替换了"
+        got_len = len(got or "")
+        last_err = (f"读回不一致：期望 {len(expect)} 字符，实际 {got_len} 字符"
+                    + ("（剪贴板为空）" if not got else
+                       f"（读到 {got[:20]!r}...）"))
+        time.sleep(0.06 * attempt)
+    return False, f"[复制校验失败] {last_err}"
+
+
+def _wait_window_hidden(hwnd, timeout=0.4, interval=0.01):
+    """等待指定窗口真正变为不可见（跨线程 hide() 是 PostMessage，需要让 UI 线程跑起来）。
+
+    超时即返回，不阻塞调用方过久——最坏情况下只是可能截到正在消失的窗口边缘。
+    返回 True 表示已确认隐藏。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+        except Exception:
+            return False   # 窗口已销毁，视为已隐藏
+        time.sleep(interval)
+    try:
+        return not win32gui.IsWindowVisible(hwnd)
+    except Exception:
+        return True
+
+
 def trigger_preset(slot):
     """触发模式：自动截已存槽位的区域 → OCR → 静默复制到剪贴板（不弹窗）。"""
     if not _lock.acquire(blocking=False):
@@ -1709,13 +1916,23 @@ def trigger_preset(slot):
         if not p or not p.get("rects"):
             msg = f"选区 {slot} 未定义，请先 {DEFINE_HOTKEY_PRETTY_TMPL % slot} 定义"
             print(f"[触发] {msg}。")
-            show_toast(msg)
+            show_toast(msg, kind="error")
             return
         name = p.get("name", "选区%d" % slot)
         mon_index = p.get("monitor", MONITOR)
 
-        # 隐藏结果窗口，避免被截进屏幕
-        result_win.hide()
+        # 隐藏结果窗口，避免被截进屏幕。
+        # 注意：ResultWindow.hide() 只是 PostMessage（跨线程安全），真实隐藏发生在
+        # UI 线程的消息循环里。若发完消息立刻截图，本程序的结果窗口可能仍然留在
+        # 屏幕上被一并截进去（表现为识别出窗口里的旧文本）。这里显式等待窗口真的
+        # 不可见后再截图；若窗口本来就没显示则立即返回，不额外等待。
+        if result_win is not None and result_win.hwnd:
+            try:
+                if win32gui.IsWindowVisible(result_win.hwnd):
+                    result_win.hide()
+                    _wait_window_hidden(result_win.hwnd, timeout=0.4)
+            except Exception:
+                pass
 
         t0 = time.time()
         mon = get_monitor(mon_index)
@@ -1735,15 +1952,25 @@ def trigger_preset(slot):
                 parts.append(t)
         text = "\n".join(parts)
         if text.strip():
-            pyperclip.copy(_crlf(text))
-            dt = (time.time() - t0) * 1000
             n_lines = len(text.splitlines())
+            ok, detail = _copy_to_clipboard(_crlf(text))
+            dt = (time.time() - t0) * 1000
             print(f"[触发] {name}(槽位{slot})：识别 {n_lines} 行，用时 {dt:.0f}ms，"
-                  f"已静默复制到剪贴板。")
-            show_toast(f"{name}(槽位{slot})：已复制 {n_lines} 行")
+                  f"已静默复制到剪贴板。{detail}")
+            show_toast(f"{name}(槽位{slot})：已复制 {n_lines} 行"
+                       if ok else f"{name}(槽位{slot})：复制失败",
+                       kind="ok" if ok else "error")
         else:
-            print(f"[触发] {name}(槽位{slot})：未识别到文字。")
-            show_toast(f"{name}(槽位{slot})：未识别到文字")
+            # 未识别到文字时同样要清空剪贴板：否则剪贴板里留着上一次的旧文本，
+            # 用户 Ctrl+V 会粘到无关内容，误以为"这次识别失败了/内容不对"。
+            # 静默清空（不弹 Toast 干扰），并把失败原因写进日志便于排障。
+            print(f"[触发] {name}(槽位{slot})：未识别到文字"
+                  f"（{len(p['rects'])} 个区域均无有效文本）。"
+                  f"请确认选区仍框在有文字的位置；若被本程序的结果窗口遮挡，"
+                  f"可按 Win+Alt+Q 重新框选。")
+            _copy_to_clipboard("", verify=False)   # 清空并记录失败详情
+            show_toast(f"{name}(槽位{slot})：未识别到文字（选区可能已失效，可按 "
+                        f"{DEFINE_HOTKEY_PRETTY_TMPL % slot} 重新框选）", kind="error")
     except Exception as e:
         print(f"[触发] 出错: {e}")
     finally:
@@ -1965,7 +2192,7 @@ def on_activate_monitor():
     # 运行中再次触发 → 停止监控
     if monitor_state["running"]:
         stop_monitor()
-        show_toast("已停止区域监控")
+        show_toast("已停止区域监控", kind="ok")
         return
     if not _lock.acquire(blocking=False):
         return  # 上一轮（区域/定义/框选）还在跑，忽略
@@ -1983,7 +2210,7 @@ def on_activate_monitor():
         # 隐藏结果窗口，避免被截进屏幕
         result_win.hide()
         start_monitor(rects, MONITOR, MONITOR_INTERVAL)
-        show_toast("已开始区域监控")
+        show_toast("已开始区域监控", kind="ok")
     except Exception as e:
         print(f"[监控] 出错: {e}")
     finally:
@@ -2262,7 +2489,7 @@ def start_monitor_from_tray(icon, item):
 def stop_monitor_from_tray(icon, item):
     """托盘“停止监控”：停止后台轮询，保留结果窗口内容。"""
     stop_monitor()
-    show_toast("已停止区域监控")
+    show_toast("已停止区域监控", kind="ok")
 
 
 # ----------------- 快捷键设置弹层（系统托盘 → 原生对话框） -----------------
@@ -2272,10 +2499,11 @@ def stop_monitor_from_tray(icon, item):
 # 以免再次与其它 WM_APP+n 撞车（历史事故见上方 _CUSTOM_MSGS 自检注释）。
 
 
-def vk_to_pynput(vk):
-    """把当前按下的按键（含修饰键状态）转成 pynput 热键字符串。
+def vk_to_hotkey_str(vk):
+    """把当前按下的按键（含修饰键状态）转成热键字符串。
 
     返回 (combo_str, main_key)；main_key 为 None 表示不支持的按键。
+    命名沿用 `<cmd>+<alt>+o` 这一类尖括号写法（本项目内部统一的热键串格式）。
     """
     ctrl = (win32api.GetKeyState(win32con.VK_CONTROL) & 0x8000) != 0
     alt = (win32api.GetKeyState(win32con.VK_MENU) & 0x8000) != 0
@@ -2566,7 +2794,7 @@ class HotkeySettingsDialog:
                 if vk in (win32con.VK_CONTROL, win32con.VK_MENU,
                           win32con.VK_SHIFT):
                     return 0
-                combo, main = vk_to_pynput(vk)
+                combo, main = vk_to_hotkey_str(vk)
                 key = self.recording
                 is_tmpl = dict((k, t) for k, _, t in self.ITEMS)[key]
                 if combo is None:
@@ -2622,7 +2850,7 @@ class HotkeySettingsDialog:
             )
             return
         save_hotkey_config(self.values)
-        show_toast("快捷键已更新并生效")
+        show_toast("快捷键已更新并生效", kind="ok")
         self._close()
 
     def _close(self):
@@ -2787,7 +3015,7 @@ class OcrSettingsDialog:
         }
         apply_ocr_config(cfg)
         save_ocr_config(cfg)
-        show_toast("OCR 选项已更新")
+        show_toast("OCR 选项已更新", kind="ok")
         self._close()
 
     def _close(self):
@@ -2928,7 +3156,7 @@ class LogViewerDialog:
             text = win32gui.GetWindowText(self.edit)
             if text:
                 pyperclip.copy(text)
-                show_toast("日志已复制到剪贴板")
+                show_toast("日志已复制到剪贴板", kind="ok")
         except Exception as e:
             print(f"[日志] 复制失败: {e}")
 
@@ -3051,16 +3279,76 @@ class LogViewerDialog:
             pass
 
 
+def _harden_stdout_encoding():
+    """把 stdout/stderr 的编码错误策略改为 'replace'，避免 print 因编码崩溃。
+
+    背景（真实事故）：打包版 console=False 时，若把输出重定向到管道，控制台编码
+    会退化为 GBKcp936。此时若 print 遇到一个 GBK 无法表示的字符（例如对勾
+    U+2713 这样的 Unicode 符号），
+    Python 会抛 UnicodeEncodeError，连带整个程序崩溃并弹出 PyInstaller 的
+    "Unhandled exception in script" 对话框。
+
+    这里用 errors='replace' 把无法编码的字符替换为 '?'，保证：
+      - 无论控制台/管道/文件用何种编码，print 都不会抛异常；
+      - 日志仍能正常输出，排障不受影响。
+    只调整错误处理策略，不改变实际编码（避免改变已写出文件的编码）。
+    """
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            if _stream is None:
+                continue
+            _stream.reconfigure(errors="replace")
+        except Exception:
+            # 老版本 Python 或已包装的流不支持 reconfigure，忽略即可
+            pass
+
+
 def main():
+    _harden_stdout_encoding()
     if "--version" in sys.argv:
         print(f"PickText {__version__}")
         return
     if "--selftest" in sys.argv:
-        # 仅初始化 OCR 引擎并退出（用于验证打包后 rapidocr 子模块可被正确动态导入）
+        # 冻结环境自检：验证 OCR 引擎可动态导入、托盘可用、键盘钩子可安装、
+        # 自定义消息号无冲突。任一项失败都会明确报出，便于排查打包问题。
+        #
+        # 注意：标记一律用纯 ASCII（[OK]/[FAIL]），**不要用对勾/叉号等 Unicode 符号**——
+        # 打包版 console=False 时 stdout 可能是 GBK 编码的管道，
+        # 一个无法编码的字符会让 print 抛 UnicodeEncodeError，
+        # 连带整个自检崩溃（曾真实发生过）。同理全部文案保持中文即可（GBK 支持）。
         try:
+            import ctypes as _ct
+            _checks = []
+            _ok = "[OK]"
+            _bad = "[FAIL]"
+
+            # 1) OCR 引擎（验证 rapidocr 子模块在冻结后仍可被 importlib 正确解析）
             eng = get_engine()
-            _msg = f"[selftest] 引擎初始化成功: {type(eng).__name__}\n[selftest] OK"
-        except Exception as _e:
+            _checks.append(f"[selftest] OCR 引擎: {type(eng).__name__} {_ok}")
+
+            # 2) 托盘依赖（pystray / Pillow 未打进包时会退化为无托盘模式）
+            _checks.append(f"[selftest] 系统托盘: "
+                           f"{'可用 ' + _ok if HAS_TRAY else _bad + ' 不可用（缺少 pystray/Pillow）'}")
+
+            # 3) 自定义消息号唯一性（历史事故：撞号导致托盘菜单点了没反应）
+            _n = len(_CUSTOM_MSGS)
+            _uniq = len(set(_CUSTOM_MSGS.values()))
+            _checks.append(f"[selftest] 自定义消息号: {_n} 个 "
+                           f"{'全部唯一 ' + _ok if _n == _uniq else _bad + ' 存在冲突！'}")
+
+            # 4) 低级键盘钩子（Esc 关闭/取消依赖它；安装失败会打日志）
+            if HAS_WIN32:
+                start_esc_listener()
+                _hook_ok = _esc_hook_hhk is not None
+                stop_esc_listener()
+                _checks.append(f"[selftest] Esc 键盘钩子: "
+                               f"{'安装/卸载正常 ' + _ok if _hook_ok else _bad + ' 安装失败'}")
+                _sz = _ct.sizeof(_KBDLLHOOKSTRUCT)
+                _checks.append(f"[selftest] 钩子结构体: {_sz} 字节 "
+                               f"{_ok if _sz == 24 else _bad + ' 异常（应为 24）'}")
+
+            _msg = "\n".join(_checks) + "\n[selftest] OK"
+        except Exception:
             import traceback
             _msg = f"[selftest] 失败:\n{traceback.format_exc()}"
         print(_msg)

@@ -1,5 +1,8 @@
 # 拾字（PickText）· 屏幕离线 OCR 取字工具（离线 · 全屏一键识别）
 
+> **开源许可：[MIT-0](LICENSE)（MIT No Attribution）** —— 可自由商用、修改、闭源分发，
+> **无需署名、无需声明来源、无需开源衍生作品**。详见下方[开源许可](#开源许可--免责声明)或直接看 [LICENSE](LICENSE)。
+
 一个常驻后台的 Windows 屏幕取字小工具。提供两种识别模式：**全屏一键识别**（抓取整屏识别全部文字）与**区域多选识别**（拖拽框选多个区域，仅识别区域内容并以换行隔开）。两者均用本地 OCR 引擎识别中英文 / 字母 / 数字，自动复制到剪贴板，并弹出结果窗口支持「框选复制」与「一键复制全部」。**全程离线，不依赖任何云端 API。**
 
 ## 功能特性
@@ -19,10 +22,9 @@
 ## 运行环境
 
 - Windows 10 / 11（依赖 Win32 API 与全局热键）
-- Python 3.13（隔离 venv，不污染系统环境）
-- 依赖：`mss`、`rapidocr-onnxruntime`、`pynput`、`pyperclip`、`numpy`、`pywin32`
-
-> 说明：本项目使用 WorkBuddy 管理的隔离 Python（`C:\Users\microsnow\.workbuddy\binaries\python\envs\ocrclient`），依赖已安装在该 venv 中。
+- Python 3.9+（推荐 3.13；隔离 venv，不污染系统环境）
+- 直接运行依赖：`mss`、`rapidocr-onnxruntime`、`pyperclip`、`numpy`、`pywin32`、`opencc`
+- 桌面版（打包形态）额外需要：`pystray`、`Pillow`；开发打包另需 `pyinstaller`
 
 ## 快速开始
 
@@ -31,12 +33,18 @@
 若 venv 未创建或未装依赖，先建隔离环境并安装：
 
 ```bat
-:: 使用 WorkBuddy 管理的 Python 创建 venv（路径按本机实际情况调整）
-C:\Users\microsnow\.workbuddy\binaries\python\versions\3.13.12\python.exe -m venv C:\Users\microsnow\.workbuddy\binaries\python\envs\ocrclient
+:: 1) 创建 venv（把 <venv> 换成你自己的路径）
+python -m venv <venv>
 
-:: 激活并安装依赖
-C:\Users\microsnow\.workbuddy\binaries\python\envs\ocrclient\Scripts\python.exe -m pip install -r requirements.txt
+:: 2) 安装依赖
+<venv>\Scripts\python.exe -m pip install -r requirements.txt
+
+:: 3) 若需要桌面版（系统托盘形态），额外安装
+<venv>\Scripts\python.exe -m pip install pystray pillow
 ```
+
+> 下文为方便统一使用占位符 `<venv>` 指代你的虚拟环境目录
+> （例如 `.venv` 或 `C:\path\to\ocrclient`）。
 
 ### 2. 运行
 
@@ -47,7 +55,7 @@ C:\Users\microsnow\.workbuddy\binaries\python\envs\ocrclient\Scripts\python.exe 
 **方式二：直接运行**
 
 ```bat
-C:\Users\microsnow\.workbuddy\binaries\python\envs\ocrclient\Scripts\python.exe main.py
+<venv>\Scripts\python.exe main.py
 ```
 
 **方式三：PowerShell 直接运行**
@@ -75,7 +83,7 @@ C:\Users\microsnow\.workbuddy\binaries\python\envs\ocrclient\Scripts\python.exe 
 | 系统托盘右键「退出」 | 退出整个程序 |
 | 按 `Ctrl+Shift+1`~`9` | 进入**定义选区**模式：拖拽框选（可多选）→ 确认后存为「选区 N」并写入 `region_presets.json` |
 | 定义模式中 左键拖拽 / 右键 / `Enter` / `Backspace` / `Esc` | 与区域模式一致（框选 / 确认 / 撤销 / 取消），取消则本次不保存 |
-| 按 `Alt+Shift+1`~`9` | **触发选区 N**：自动截该槽位区域 → OCR → 静默复制到剪贴板，并弹出轻量 Toast 提示（不抢焦点，约 1.6 秒后自动消失）；控制台同步打印日志 |
+| 按 `Alt+Shift+1`~`9` | **触发选区 N**：自动截该槽位区域 → OCR → 静默复制到剪贴板，并弹出轻量 Toast 提示（不抢焦点，约 1.6 秒后自动消失，**成功为青色边框 / 失败为红色边框且停留更久**）；控制台同步打印日志 |
 | 按 `Ctrl+Alt+M` | **锁定区域监控**：框选一个或多个区域后进入轮询模式，画面变化时自动 OCR 并刷新结果窗口（字幕/歌词场景无需手动重复截取）；再次按下 `Ctrl+Alt+M` 或 `Esc` 停止 |
 | 托盘菜单「开始监控区域...」/「停止监控」 | 与快捷键等价，菜单项随监控状态自动显隐 |
 
@@ -89,8 +97,39 @@ C:\Users\microsnow\.workbuddy\binaries\python\envs\ocrclient\Scripts\python.exe 
 把屏幕上**固定的一块/几块区域**存成「预设选区」，之后用快捷键一键自动识别并复制，省去每次拖拽。
 
 1. **定义**：按 `Ctrl+Shift+1`（或 2~9），屏幕变暗进入框选，拖拽框选需要的区域（可多次拖拽框多个），右键 / `Enter` 确认。确认后该区域被存为「选区 1」并写入 `region_presets.json`。
-2. **触发**：之后每次想取这块文字，只需按 `Alt+Shift+1`，程序自动截取已存区域 → OCR → 静默复制到剪贴板，可直接 `Ctrl+V` 粘贴；屏幕右下角会弹出轻量 Toast 提示（如 `选区1(槽位1)：已复制 N 行`，约 1.6 秒后自动消失，且不抢走当前窗口焦点），控制台同步打印日志。
+2. **触发**：之后每次想取这块文字，只需按 `Alt+Shift+1`，程序自动截取已存区域 → OCR → 静默复制到剪贴板，可直接 `Ctrl+V` 粘贴；屏幕下方会弹出轻量 Toast 提示（如 `选区1(槽位1)：已复制 N 行`，约 1.6 秒后自动消失，且不抢走当前窗口焦点），控制台同步打印日志。
 3. **重定义 / 取消**：再次按同一个 `Ctrl+Shift+N` 可重新框选覆盖；框选过程中按 `ESC` 取消（不保存）。
+
+> **选区失效怎么办**：选区保存的是**绝对屏幕坐标**。若框选的目标界面会滚动、
+> 折叠、改变窗口高度，或换了显示器/DPI，之后按触发键可能提示
+> **「未识别到文字」（红色 Toast）**——说明框住的位置已经没有文字了。
+> 此时按 `Ctrl+Shift+N` 重新框选即可。
+>
+> **识别失败时程序会清空剪贴板**（而不是保留上一次的旧文本），这样
+> `Ctrl+V` 粘贴出来为空就能立刻确认"这次确实没识别到"，不会误粘到无关内容。
+> 失败详情（区域数量、可能原因）见托盘「运行日志」。
+
+### 复制到剪贴板会做写后校验
+
+Windows 剪贴板是**全局共享**资源。`pyperclip.copy()` 在以下情况会**静默失败**
+—— 不抛异常、不写内容，但调用方以为成功了：
+
+- 剪贴板被其它程序短暂独占（`OpenClipboard` 返回 0）
+- 内容被远程桌面、输入法剪贴板同步等组件劫持
+- 含特殊字符导致写入被截断
+
+表现就是「日志说已复制，`Ctrl+V` 粘出来却是空的或上一次的旧内容」。
+
+因此本程序在写入后会**立即读回比对**，不一致自动重试（最多 3 次），
+仍失败则把原因写进日志并在Toast 上提示「复制失败」。日志形如：
+
+```text
+[触发] 选区1(槽位1)：识别 5 行，用时 210ms，已静默复制到剪贴板。
+[触发] 选区1(槽位1)：识别 5 行，用时 198ms，已静默复制到剪贴板。[复制校验失败] 读回不一致：期望 182 字符，实际 0 字符（剪贴板为空）
+```
+
+看到 `[复制校验失败]` 就说明确实是写入失败（而非识别问题），此时可尝试：
+关闭剪贴板管理类软件 / 输入法剪贴板同步 / 远程桌面，再重新触发一次。
 
 > 预设坐标以「显示器左上角」为原点。若改了屏幕分辨率 / 显示器布局，建议重新定义对应选区。
 > 选区别名（名称）默认 `选区N`，如需改名可直接编辑 `region_presets.json` 中对应条目的 `name` 字段。
@@ -171,7 +210,7 @@ C:\Users\microsnow\.workbuddy\binaries\python\envs\ocrclient\Scripts\python.exe 
 | `MONITOR_INTERVAL` | `1.0` | 监控轮询间隔（秒）；画面不变时跳过 OCR 以省 CPU，最小 0.3 秒 |
 | `OCR_SETTINGS_FILE` | `ocr_settings.json` | OCR 选项落盘文件（竖排 / 繁体 / 标点）；由托盘「OCR 选项...」弹层写入，重启后自动加载 |
 
-> 快捷键语法遵循 `pynput`：`+` 连接组合键，`<cmd>`(Win) `<ctrl>` `<alt>` `<shift>` `<esc>` 等为按键名。
+> 快捷键字符串格式：`+` 连接组合键，`<cmd>`(Win) `<ctrl>` `<alt>` `<shift>` `<esc>` `<space>` `<tab>` `<enter>` `<f1>`~`<f12>` 等为按键名。本项目内部统一使用这一写法，由 `_parse_hotkey()` 解析为 Win32 修饰符与虚拟键码。
 
 ## 文件结构
 
@@ -179,19 +218,71 @@ C:\Users\microsnow\.workbuddy\binaries\python\envs\ocrclient\Scripts\python.exe 
 09-ocr/
 ├── main.py          # 主程序：截屏 + OCR + 剪贴板 + 原生结果窗口 + 选区预设 + 系统托盘
 ├── layout.py        # OCR 后处理（纯函数）：竖排几何重排 / 简繁转换 / 离线标点
-├── region_presets.json # 选区预设落盘（运行时生成；定义选区后自动创建）
 ├── requirements.txt # Python 依赖清单（含 opencc 用于简繁转换）
 ├── ocrclient.spec   # PyInstaller 单文件夹打包配置（onedir）
-├── build_icon.py    # 图标生成脚本（矢量绘制 → 多尺寸 ICO + 预览图）
+├── build_icon.py    # 图标生成脚本（矢量绘制 → 多尺寸ICO + 预览图）
+├── LICENSE          # MIT-0 许可证（无需署名，可闭源商用）
+├── THIRD_PARTY_NOTICES.md # 第三方依赖许可清单（含 LGPL 专项说明）
+├── CONTRIBUTING.md  # 贡献指南
 ├── assets/
 │   ├── icon.ico         # 桌面程序图标（拾字品牌：渐变磁贴 + 「字」+ 取景框，16~256 多尺寸）
 │   └── icon_preview.png # 512px 图标预览（用于文档/展示）
 ├── tests/
-│   └── test_ocr.py  # pytest 纯函数单测（换行/热键/导出/竖排/简繁/监控）
+│   └── test_ocr.py  # pytest 单测（换行/热键/导出/竖排/简繁/监控/键盘钩子）
 ├── run.bat          # 开发态双击启动器（调用 run.ps1）
 ├── run.ps1          # PowerShell 启动脚本（环境检查 + 启动）
 └── README.md        # 本说明文档
 ```
+
+> `region_presets.json`、`hotkeys.json`、`ocrclient.log` 等为运行时文件，**不入库**
+> （已在 `.gitignore` 中排除），首次使用相关功能时自动生成。
+
+## 开源许可 / 免责声明
+
+### 你可以做什么
+
+本项目采用 **[MIT No Attribution (MIT-0)](LICENSE)** 许可证。简单说：
+
+| 权限 | 是否需要你做事 |
+|---|---|
+| 免费用于商业用途（含闭源商业集成、收费分发、内网部署） | ✅ 无需申请 |
+| 免费修改、二次创作 | ✅ 无需申请 |
+| 分发衍生作品 | ✅ 无需申请 |
+| **无需署名** —— 不必在衍生作品中标注原作者或项目名 | ✅ 无需署名 |
+| **无需声明来源** —— 不必附带本项目许可证声明 | ✅ 无需声明 |
+| **无需开源衍生作品** —— 基于本项目的代码可以是完全闭源的 | ✅ 无需开源 |
+| 用于闭源商业产品 | ✅ 无 copyleft 传染 |
+
+一句话：**拿去用、拿去改、拿去卖，不必问、不必谢、不必还。**
+
+> MIT-0 与 Unlicense、CC0 的法律效果基本一致（零义务），区别在于 MIT-0 保留
+> MIT 的外形，企业法务系统扫描即过，不易触发人工审核。
+
+### 唯一的约束（免责声明）
+
+本软件按**"原样"**提供，不附带任何明示或默示的担保（包括但不限于对适销性、
+特定用途适用性的担保）。作者与贡献者不对因使用或无法使用本软件而产生的
+任何直接、间接、偶然、特殊或后果性损害承担责任。
+
+换言之：**这是一个工具，不是一个担保。** 请自行评估是否适合你的场景，
+重要数据请自行保留备份。
+
+### 第三方依赖
+
+本项目**自身代码**适用 MIT-0，但它依赖的第三方库各自适用其原始许可证。
+完整清单见 **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**，要点：
+
+- 绝大多数依赖为 MIT / BSD / Apache-2.0 / PSF，均允许闭源商业集成
+- **pystray 为 LGPL-3.0-or-later**（系统托盘图标）—— 这是唯一的 copyleft 组件。
+  LGPL **允许闭源链接与商业集成**，仅要求用户可替换该库；本项目按原样使用、
+  未作任何修改，且通过标准 pip 机制引入，可替换性由生态天然保证。
+  你唯一需要做的，是在产品中保留一行告知（如"本软件使用了 pystray (LGPL-3.0)"），
+  并随分发附带 LGPL v3 与 GPL v3 全文。
+
+这些义务针对的是**第三方库的代码本身**，不影响你对自己代码的完全支配权。
+
+> **关于 OCR 模型**：内置的 PP-OCR ONNX 模型来自百度飞桨 PaddleOCR 团队，
+> 遵循 Apache-2.0，可自由商用。
 
 ## 常见问题
 
@@ -222,14 +313,14 @@ A：RapidOCR 为行列文本识别，适合一般文字抓取。如需版面分�
 
 ### 构建环境
 - Windows 10 / 11（构建机即目标平台，无需跨平台）
-- Python 3.13（或 3.9+）隔离 venv
+- Python 3.9+（推荐 3.13）虚拟环境
 - 依赖：`requirements.txt` + `pyinstaller` + `pystray`（托盘，依赖 `pillow`）
 
 ### 构建步骤
 ```bat
 :: 1) 建隔离 venv 并安装依赖（首次）
-C:\Users\microsnow\.workbuddy\binaries\python\versions\3.13.12\python.exe -m venv build_venv
-build_venv\Scripts\python.exe -m pip install -r requirements.txt pyinstaller pystray
+python -m venv build_venv
+build_venv\Scripts\python.exe -m pip install -r requirements.txt pyinstaller pystray pillow
 
 :: 2) 打包（单文件夹 onedir）
 build_venv\Scripts\python.exe -m PyInstaller -y ocrclient.spec
@@ -254,3 +345,34 @@ build_venv\Scripts\python.exe -m PyInstaller -y ocrclient.spec
 ### 注意
 - `region_presets.json` 在打包后写入 `dist/OCRClient/`（与 exe 同级），重定义选区会更新该文件。
 - 杀毒软件可能对 PyInstaller 产物误报，属正常现象；如需消除可对 exe 进行代码签名。
+
+### 命令行参数与自检
+
+桌面版虽无常驻控制台，但仍支持几个命令行参数（在 `OCRClient.exe` 所在目录执行）：
+
+| 参数 | 作用 |
+|---|---|
+| `--version` | 输出版本号后退出（如 `PickText 2.0.0`） |
+| `--selftest` | **自检并退出**：验证 OCR 引擎、托盘依赖、自定义消息号、Esc 键盘钩子 |
+| `--no-tray` | 强制不启用系统托盘（便于排查托盘相关问题） |
+| `--tray` | 源码直跑时也启用托盘（打包版默认已启用） |
+
+**`--selftest` 排障用法**：结果同时写到控制台**和**同目录的 `selftest_result.txt`
+（UTF-8编码，无控制台时用记事本打开即可）。典型输出：
+
+```text
+[selftest] OCR 引擎: RapidOCR [OK]
+[selftest] 系统托盘: 可用 [OK]
+[selftest] 自定义消息号: 11 个 全部唯一 [OK]
+[selftest] Esc 键盘钩子: 安装/卸载正常 [OK]
+[selftest] 钩子结构体: 24 字节 [OK]
+[selftest] OK
+```
+
+任一项显示 `[FAIL]` 即对应功能在打包环境中不可用（常见于杀毒软件拦截 DLL，或复制
+`dist/OCRClient/` 时漏了 `_internal/` 子目录）。
+
+> 标记刻意使用纯 ASCII `[OK]` / `[FAIL]` 而非 ✓/✗：打包版无控制台，输出重定向到
+> 管道时编码会退化为 GBK，非 ASCII 符号会触发 `UnicodeEncodeError`。程序已对
+> stdout 做了 `errors='replace'` 加固，即使输出意外含非 GBK 字符也只会降级显示为 `?`，
+> 不会崩溃。

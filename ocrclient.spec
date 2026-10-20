@@ -5,7 +5,7 @@
 # 关键点：
 #   1) RapidOCR 的 ONNX 模型在包内的 models/ 子目录，必须用 collect_data_files 收集，
 #      否则打包后运行会报“找不到模型”。
-#   2) pywin32 / pynput / pystray 需要显式 hiddenimports，否则运行时 ImportError。
+#   2) pywin32 / pystray 需要显式hiddenimports，否则运行时 ImportError。
 #   3) console=False → 无黑框控制台，配合系统托盘常驻（桌面应用形态）。
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
@@ -17,8 +17,7 @@ rapidocr_datas = collect_data_files("rapidocr_onnxruntime")
 
 # 需要收集子模块的库（确保内部模块被打包进去）
 hidden_imports = (
-    collect_submodules("pynput")
-    + collect_submodules("pystray")
+    collect_submodules("pystray")
     + collect_submodules("rapidocr_onnxruntime")  # ch_ppocr_v3_det/rec/cls 靠动态导入，必须显式收集
 )
 

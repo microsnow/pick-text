@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 *.pyc
 
-# WorkBuddy project data (memory/cache)
+# 本地开发工具数据（记忆/缓存，不应进入公开仓库）
 .workbuddy/
 
 # virtual environments (if created inside project)
@@ -21,6 +21,9 @@ dist*/
 # 运行时本地配置（用户自定义快捷键 hotkeys.json，不同机器不一样）
 hotkeys.json
 
+# 运行时本地配置（OCR 选项：竖排/繁体/标点/增强开关）
+ocr_settings.json
+
 # 运行时本地数据（用户选区预设，不同机器不一样）
 region_presets.json
 
@@ -29,3 +32,8 @@ region_presets.json
 
 # 分发用 zip 包（由 dist/ 压缩生成，体积大、可重构建）
 OCRClient-win64.zip
+PickText-win64-*.zip
+exports/
+
+# 自测/临时产物
+selftest_result.txt
