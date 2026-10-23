@@ -481,4 +481,4 @@ build_venv\Scripts\python.exe -m PyInstaller -y ocrclient.spec
 
 ---
 
-<sub>如果你在用拾字做古籍整理、字幕转写或别的什么事，欢迎到 [Discussions](https://github.com/microsnow/pick-text/discussions) 说一声——被用到哪里，是这个项目最想知道的事。</sub>
+<sub>如果你在用拾字做古籍整理、字幕转写或别的什么事，欢迎到 [「你在用拾字做什么？」](https://github.com/microsnow/pick-text/discussions/1) 说一声——被用到哪里，是这个项目最想知道的事。</sub>
